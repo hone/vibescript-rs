@@ -36,6 +36,7 @@ pub enum BinaryOp {
     GtEq,
     And,
     Or,
+    Index,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

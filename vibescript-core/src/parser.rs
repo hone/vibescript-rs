@@ -19,27 +19,58 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                 Token::Ident(name) => Expr::Variable(name),
             };
 
+            let array = expr.clone()
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBracket), just(Token::RBracket))
+                .map(Expr::Array);
+
+            let hash = select! { Token::Ident(name) => name }
+                .or(select! { Token::String(s) => s })
+                .then_ignore(just(Token::Colon))
+                .then(expr.clone())
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace))
+                .map(Expr::Hash);
+
             let atom = literal
                 .or(variable)
+                .or(array)
+                .or(hash)
                 .or(expr.clone().delimited_by(just(Token::LParen), just(Token::RParen)));
 
-            let call = atom.clone().foldl(
-                expr.clone()
-                    .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .repeated(),
-                |lhs, args| {
-                    if let Expr::Variable(name) = lhs {
-                        Expr::Call {
-                            func: name,
-                            args,
-                            kwargs: vec![],
+            let call_or_index = atom.clone().foldl(
+                choice((
+                    expr.clone()
+                        .separated_by(just(Token::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(just(Token::LParen), just(Token::RParen))
+                        .map(|args| ("call", args)),
+                    expr.clone()
+                        .delimited_by(just(Token::LBracket), just(Token::RBracket))
+                        .map(|idx| ("index", vec![idx])),
+                )).repeated(),
+                |lhs, (kind, args)| {
+                    match kind {
+                        "call" => {
+                            if let Expr::Variable(name) = lhs {
+                                Expr::Call { func: name, args, kwargs: vec![] }
+                            } else {
+                                lhs // Simplified for MVP
+                            }
                         }
-                    } else {
-                        // For MVP, we only support direct function calls on names
-                        lhs
+                        "index" => {
+                             Expr::Binary {
+                                left: Box::new(lhs),
+                                op: BinaryOp::Index,
+                                right: Box::new(args[0].clone()),
+                            }
+                        }
+                        _ => unreachable!()
                     }
                 }
             );
@@ -48,7 +79,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                 .to(UnaryOp::Neg)
                 .or(just(Token::Not).to(UnaryOp::Not))
                 .repeated()
-                .foldr(call, |op, expr| Expr::Unary {
+                .foldr(call_or_index, |op, expr| Expr::Unary {
                     op,
                     expr: Box::new(expr),
                 });

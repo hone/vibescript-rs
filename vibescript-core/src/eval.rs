@@ -147,7 +147,20 @@ impl Engine {
                 }
                 self.call_function(func, arg_vals)
             }
-            _ => Err("Expression not yet implemented".to_string()),
+            Expr::Array(elements) => {
+                let mut vals = Vec::new();
+                for e in elements {
+                    vals.push(self.eval_expr_mut(e)?);
+                }
+                Ok(Value::Array(vals))
+            }
+            Expr::Hash(pairs) => {
+                let mut hash = HashMap::new();
+                for (key, val_expr) in pairs {
+                    hash.insert(key.clone(), self.eval_expr_mut(val_expr)?);
+                }
+                Ok(Value::Hash(hash))
+            }
         }
     }
 
@@ -169,7 +182,6 @@ impl Engine {
             (func.params.clone(), func.body.clone())
         };
 
-        // New scope
         let mut new_scope = HashMap::new();
         for (param, val) in params.iter().zip(args) {
             new_scope.insert(param.clone(), val);
@@ -196,12 +208,32 @@ impl Engine {
 
     fn eval_binary(&self, lhs: Value, op: BinaryOp, rhs: Value) -> Result<Value, String> {
         match (lhs, op, rhs) {
+            // Indexing
+            (Value::Array(arr), BinaryOp::Index, Value::Int(i)) => {
+                let idx = if i < 0 {
+                    arr.len() as i64 + i
+                } else {
+                    i
+                };
+                if idx < 0 || idx >= arr.len() as i64 {
+                    Err(format!("Array index {} out of bounds (length {})", i, arr.len()))
+                } else {
+                    Ok(arr[idx as usize].clone())
+                }
+            }
+            (Value::Hash(hash), BinaryOp::Index, Value::String(s)) => {
+                Ok(hash.get(&s).cloned().unwrap_or(Value::Nil))
+            }
+
+            // Comparisons
             (l, BinaryOp::Eq, r) => Ok(Value::Bool(l == r)),
             (l, BinaryOp::NotEq, r) => Ok(Value::Bool(l != r)),
             (Value::Int(l), BinaryOp::Lt, Value::Int(r)) => Ok(Value::Bool(l < r)),
             (Value::Int(l), BinaryOp::LtEq, Value::Int(r)) => Ok(Value::Bool(l <= r)),
             (Value::Int(l), BinaryOp::Gt, Value::Int(r)) => Ok(Value::Bool(l > r)),
             (Value::Int(l), BinaryOp::GtEq, Value::Int(r)) => Ok(Value::Bool(l >= r)),
+
+            // Arithmetic - Int
             (Value::Int(l), BinaryOp::Add, Value::Int(r)) => Ok(Value::Int(l + r)),
             (Value::Int(l), BinaryOp::Sub, Value::Int(r)) => Ok(Value::Int(l - r)),
             (Value::Int(l), BinaryOp::Mul, Value::Int(r)) => Ok(Value::Int(l * r)),
@@ -216,12 +248,24 @@ impl Engine {
                 };
                 Ok(Value::Int(res))
             }
+
+            // Arithmetic - Float & Mixed
             (Value::Float(l), BinaryOp::Add, Value::Float(r)) => Ok(Value::Float(l + r)),
             (Value::Float(l), BinaryOp::Add, Value::Int(r)) => Ok(Value::Float(l + r as f64)),
             (Value::Int(l), BinaryOp::Add, Value::Float(r)) => Ok(Value::Float(l as f64 + r)),
+
+            (Value::Float(l), BinaryOp::Sub, Value::Float(r)) => Ok(Value::Float(l - r)),
+            (Value::Float(l), BinaryOp::Sub, Value::Int(r)) => Ok(Value::Float(l - r as f64)),
+            (Value::Int(l), BinaryOp::Sub, Value::Float(r)) => Ok(Value::Float(l as f64 - r)),
+
+            (Value::Float(l), BinaryOp::Mul, Value::Float(r)) => Ok(Value::Float(l * r)),
+            (Value::Float(l), BinaryOp::Mul, Value::Int(r)) => Ok(Value::Float(l * r as f64)),
+            (Value::Int(l), BinaryOp::Mul, Value::Float(r)) => Ok(Value::Float(l as f64 * r)),
+
             (Value::Float(l), BinaryOp::Div, Value::Int(r)) => Ok(Value::Float(l / r as f64)),
             (Value::Int(l), BinaryOp::Div, Value::Float(r)) => Ok(Value::Float(l as f64 / r)),
             (Value::Float(l), BinaryOp::Div, Value::Float(r)) => Ok(Value::Float(l / r)),
+
             _ => Err("Binary operation not supported".to_string()),
         }
     }

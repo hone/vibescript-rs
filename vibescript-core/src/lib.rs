@@ -165,6 +165,35 @@ mod tests {
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Int(13));
     }
+
+    #[test]
+    fn test_collections() {
+        let source = "arr = [1, 2, 3]\narr[1]";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(2));
+
+        let source = "h = {name: \"Gwen\", age: 25}\nh[\"name\"]";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::String("Gwen".to_string()));
+    }
+
+    #[test]
+    fn test_complex_flow() {
+        let source = "
+            def process(items)
+                total = 0
+                i = 0
+                while i < 3
+                    total = total + items[i]
+                    i = i + 1
+                end
+                return total
+            end
+            process([10, 20, 30])
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(60));
+    }
 }
 
 export!(MyEngine);
