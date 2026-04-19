@@ -7,12 +7,14 @@ pub enum Token {
     Def,
     #[token("if")]
     If,
+    #[token("elsif")]
+    Elsif,
     #[token("else")]
     Else,
     #[token("end")]
     End,
-    #[token("loop")]
-    Loop,
+    #[token("while")]
+    While,
     #[token("return")]
     Return,
     #[token("true")]

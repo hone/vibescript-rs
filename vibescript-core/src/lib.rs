@@ -133,6 +133,38 @@ mod tests {
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Float(3.5));
     }
+
+    #[test]
+    fn test_if_else() {
+        let source = "x = 10\nif x > 5\n  y = 1\nelse\n  y = 2\nend\ny";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(1));
+
+        let source = "x = 3\nif x > 5\n  y = 1\nelse\n  y = 2\nend\ny";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(2));
+    }
+
+    #[test]
+    fn test_while_loop() {
+        let source = "i = 0\nsum = 0\nwhile i < 5\n  i = i + 1\n  sum = sum + i\nend\nsum";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(15));
+    }
+
+    #[test]
+    fn test_functions() {
+        let source = "def add(a, b)\n  return a + b\nend\nadd(10, 20)";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(30));
+    }
+
+    #[test]
+    fn test_recursion() {
+        let source = "def fib(n)\n  if n <= 1\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\nfib(7)";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(13));
+    }
 }
 
 export!(MyEngine);

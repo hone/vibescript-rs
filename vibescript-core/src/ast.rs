@@ -56,7 +56,8 @@ pub enum Stmt {
         then_branch: Vec<Stmt>,
         else_branch: Option<Vec<Stmt>>,
     },
-    Loop {
+    While {
+        condition: Expr,
         body: Vec<Stmt>,
     },
     Function {

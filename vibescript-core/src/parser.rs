@@ -4,70 +4,152 @@ use crate::value::Value;
 use chumsky::prelude::*;
 
 pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'a, Token>>> {
-    let expr = recursive(|expr| {
-        let literal = select! {
-            Token::Int(i) => Expr::Literal(Value::Int(i)),
-            Token::Float(f) => Expr::Literal(Value::Float(f)),
-            Token::String(s) => Expr::Literal(Value::String(s)),
-            Token::True => Expr::Literal(Value::Bool(true)),
-            Token::False => Expr::Literal(Value::Bool(false)),
-            Token::Nil => Expr::Literal(Value::Nil),
-        };
+    recursive(|stmt| {
+        let expr = recursive(|expr| {
+            let literal = select! {
+                Token::Int(i) => Expr::Literal(Value::Int(i)),
+                Token::Float(f) => Expr::Literal(Value::Float(f)),
+                Token::String(s) => Expr::Literal(Value::String(s)),
+                Token::True => Expr::Literal(Value::Bool(true)),
+                Token::False => Expr::Literal(Value::Bool(false)),
+                Token::Nil => Expr::Literal(Value::Nil),
+            };
 
-        let variable = select! {
-            Token::Ident(name) => Expr::Variable(name),
-        };
+            let variable = select! {
+                Token::Ident(name) => Expr::Variable(name),
+            };
 
-        let atom = literal
-            .or(variable)
-            .or(expr.delimited_by(just(Token::LParen), just(Token::RParen)));
+            let atom = literal
+                .or(variable)
+                .or(expr.clone().delimited_by(just(Token::LParen), just(Token::RParen)));
 
-        let unary = just(Token::Minus)
-            .to(UnaryOp::Neg)
-            .or(just(Token::Not).to(UnaryOp::Not))
-            .repeated()
-            .foldr(atom, |op, expr| Expr::Unary {
-                op,
-                expr: Box::new(expr),
+            let call = atom.clone().foldl(
+                expr.clone()
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .repeated(),
+                |lhs, args| {
+                    if let Expr::Variable(name) = lhs {
+                        Expr::Call {
+                            func: name,
+                            args,
+                            kwargs: vec![],
+                        }
+                    } else {
+                        // For MVP, we only support direct function calls on names
+                        lhs
+                    }
+                }
+            );
+
+            let unary = just(Token::Minus)
+                .to(UnaryOp::Neg)
+                .or(just(Token::Not).to(UnaryOp::Not))
+                .repeated()
+                .foldr(call, |op, expr| Expr::Unary {
+                    op,
+                    expr: Box::new(expr),
+                });
+
+            let mul_div = unary.clone().foldl(
+                just(Token::Star)
+                    .to(BinaryOp::Mul)
+                    .or(just(Token::Slash).to(BinaryOp::Div))
+                    .then(unary.clone())
+                    .repeated(),
+                |lhs, (op, rhs)| Expr::Binary {
+                    left: Box::new(lhs),
+                    op,
+                    right: Box::new(rhs),
+                },
+            );
+
+            let add_sub = mul_div.clone().foldl(
+                just(Token::Plus)
+                    .to(BinaryOp::Add)
+                    .or(just(Token::Minus).to(BinaryOp::Sub))
+                    .then(mul_div.clone())
+                    .repeated(),
+                |lhs, (op, rhs)| Expr::Binary {
+                    left: Box::new(lhs),
+                    op,
+                    right: Box::new(rhs),
+                },
+            );
+
+            let comparison = add_sub.clone().foldl(
+                just(Token::Eq).to(BinaryOp::Eq)
+                    .or(just(Token::NotEq).to(BinaryOp::NotEq))
+                    .or(just(Token::Lt).to(BinaryOp::Lt))
+                    .or(just(Token::LtEq).to(BinaryOp::LtEq))
+                    .or(just(Token::Gt).to(BinaryOp::Gt))
+                    .or(just(Token::GtEq).to(BinaryOp::GtEq))
+                    .then(add_sub.clone())
+                    .repeated(),
+                |lhs, (op, rhs)| Expr::Binary {
+                    left: Box::new(lhs),
+                    op,
+                    right: Box::new(rhs),
+                }
+            );
+
+            comparison
+        });
+
+        let block = stmt.repeated().collect::<Vec<_>>();
+
+        let if_stmt = just(Token::If)
+            .ignore_then(expr.clone())
+            .then(block.clone())
+            .then(just(Token::Else).ignore_then(block.clone()).or_not())
+            .then_ignore(just(Token::End))
+            .map(|((condition, then_branch), else_branch)| Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
             });
 
-        let mul_div = unary.clone().foldl(
-            just(Token::Star)
-                .to(BinaryOp::Mul)
-                .or(just(Token::Slash).to(BinaryOp::Div))
-                .then(unary.clone())
-                .repeated(),
-            |lhs, (op, rhs)| Expr::Binary {
-                left: Box::new(lhs),
-                op,
-                right: Box::new(rhs),
-            },
-        );
+        let while_stmt = just(Token::While)
+            .ignore_then(expr.clone())
+            .then(block.clone())
+            .then_ignore(just(Token::End))
+            .map(|(condition, body)| Stmt::While { condition, body });
 
-        let add_sub = mul_div.clone().foldl(
-            just(Token::Plus)
-                .to(BinaryOp::Add)
-                .or(just(Token::Minus).to(BinaryOp::Sub))
-                .then(mul_div.clone())
-                .repeated(),
-            |lhs, (op, rhs)| Expr::Binary {
-                left: Box::new(lhs),
-                op,
-                right: Box::new(rhs),
-            },
-        );
+        let def_stmt = just(Token::Def)
+            .ignore_then(select! { Token::Ident(name) => name })
+            .then(
+                select! { Token::Ident(name) => name }
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .or(empty().to(vec![]))
+            )
+            .then(block.clone())
+            .then_ignore(just(Token::End))
+            .map(|((name, params), body)| Stmt::Function { name, params, body });
 
-        add_sub
-    });
+        let assignment = select! {
+            Token::Ident(name) => name,
+        }
+        .then_ignore(just(Token::Assign))
+        .then(expr.clone())
+        .map(|(name, value)| Stmt::Assignment { name, value });
 
-    let assignment = select! {
-        Token::Ident(name) => name,
-    }
-    .then_ignore(just(Token::Assign))
-    .then(expr.clone())
-    .map(|(name, value)| Stmt::Assignment { name, value });
+        let return_stmt = just(Token::Return)
+            .ignore_then(expr.clone().or_not())
+            .map(Stmt::Return);
 
-    let stmt = assignment.or(expr.clone().map(Stmt::Expression));
-
-    stmt.repeated().collect::<Vec<_>>().then_ignore(end())
+        if_stmt
+            .or(while_stmt)
+            .or(def_stmt)
+            .or(return_stmt)
+            .or(assignment)
+            .or(expr.clone().map(Stmt::Expression))
+    })
+    .repeated()
+    .collect::<Vec<_>>()
+    .then_ignore(end())
 }
