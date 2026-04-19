@@ -60,7 +60,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                             if let Expr::Variable(name) = lhs {
                                 Expr::Call { func: name, args, kwargs: vec![] }
                             } else {
-                                lhs // Simplified for MVP
+                                lhs
                             }
                         }
                         "index" => {
@@ -126,7 +126,29 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                 }
             );
 
-            comparison
+            let logical_and = comparison.clone().foldl(
+                just(Token::And).to(BinaryOp::And)
+                    .then(comparison.clone())
+                    .repeated(),
+                |lhs, (op, rhs)| Expr::Binary {
+                    left: Box::new(lhs),
+                    op,
+                    right: Box::new(rhs),
+                }
+            );
+
+            let logical_or = logical_and.clone().foldl(
+                just(Token::Or).to(BinaryOp::Or)
+                    .then(logical_and.clone())
+                    .repeated(),
+                |lhs, (op, rhs)| Expr::Binary {
+                    left: Box::new(lhs),
+                    op,
+                    right: Box::new(rhs),
+                }
+            );
+
+            logical_or
         });
 
         let block = stmt.repeated().collect::<Vec<_>>();

@@ -136,6 +136,21 @@ impl Engine {
                 self.eval_unary(*op, &val)
             }
             Expr::Binary { left, op, right } => {
+                if *op == BinaryOp::And {
+                    let lhs = self.eval_expr_mut(left)?;
+                    if !self.is_truthy(&lhs) {
+                        return Ok(lhs);
+                    }
+                    return self.eval_expr_mut(right);
+                }
+                if *op == BinaryOp::Or {
+                    let lhs = self.eval_expr_mut(left)?;
+                    if self.is_truthy(&lhs) {
+                        return Ok(lhs);
+                    }
+                    return self.eval_expr_mut(right);
+                }
+
                 let lhs = self.eval_expr_mut(left)?;
                 let rhs = self.eval_expr_mut(right)?;
                 self.eval_binary(lhs, *op, rhs)

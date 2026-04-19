@@ -194,6 +194,25 @@ mod tests {
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Int(60));
     }
+
+    #[test]
+    fn test_logical_operators() {
+        let source = "true && false";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Bool(false));
+
+        let source = "true || false";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Bool(true));
+
+        let source = "false && (1 / 0)"; // Short-circuit
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Bool(false));
+
+        let source = "true || (1 / 0)"; // Short-circuit
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
 }
 
 export!(MyEngine);
