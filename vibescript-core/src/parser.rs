@@ -42,23 +42,37 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                 .or(hash)
                 .or(expr.clone().delimited_by(just(Token::LParen), just(Token::RParen)));
 
-            let call_or_index = atom.clone().foldl(
+            let call_or_index_or_member = atom.clone().foldl(
                 choice((
+                    // Function Call
                     expr.clone()
                         .separated_by(just(Token::Comma))
                         .allow_trailing()
                         .collect::<Vec<_>>()
                         .delimited_by(just(Token::LParen), just(Token::RParen))
-                        .map(|args| ("call", args)),
+                        .map(|args| ("call", args, String::new())),
+                    // Array Indexing
                     expr.clone()
                         .delimited_by(just(Token::LBracket), just(Token::RBracket))
-                        .map(|idx| ("index", vec![idx])),
+                        .map(|idx| ("index", vec![idx], String::new())),
+                    // Member Access / Method Call
+                    just(Token::Dot)
+                        .ignore_then(select! { Token::Ident(name) => name })
+                        .then(
+                            expr.clone()
+                                .separated_by(just(Token::Comma))
+                                .allow_trailing()
+                                .collect::<Vec<_>>()
+                                .delimited_by(just(Token::LParen), just(Token::RParen))
+                                .or_not()
+                        )
+                        .map(|(name, args)| ("member", args.unwrap_or_default(), name)),
                 )).repeated(),
-                |lhs, (kind, args)| {
+                |lhs, (kind, args, name)| {
                     match kind {
                         "call" => {
-                            if let Expr::Variable(name) = lhs {
-                                Expr::Call { func: name, args, kwargs: vec![] }
+                            if let Expr::Variable(func_name) = lhs {
+                                Expr::Call { func: func_name, args, kwargs: vec![] }
                             } else {
                                 lhs
                             }
@@ -70,6 +84,13 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                                 right: Box::new(args[0].clone()),
                             }
                         }
+                        "member" => {
+                            Expr::Member {
+                                receiver: Box::new(lhs),
+                                method: name,
+                                args,
+                            }
+                        }
                         _ => unreachable!()
                     }
                 }
@@ -79,17 +100,19 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                 .to(UnaryOp::Neg)
                 .or(just(Token::Not).to(UnaryOp::Not))
                 .repeated()
-                .foldr(call_or_index, |op, expr| Expr::Unary {
+                .foldr(call_or_index_or_member, |op, expr| Expr::Unary {
                     op,
                     expr: Box::new(expr),
                 });
 
-            let mul_div = unary.clone().foldl(
-                just(Token::Star)
-                    .to(BinaryOp::Mul)
-                    .or(just(Token::Slash).to(BinaryOp::Div))
-                    .then(unary.clone())
-                    .repeated(),
+            let mul_div_mod = unary.clone().foldl(
+                choice((
+                    just(Token::Star).to(BinaryOp::Mul),
+                    just(Token::Slash).to(BinaryOp::Div),
+                    just(Token::Percent).to(BinaryOp::Modulo),
+                ))
+                .then(unary.clone())
+                .repeated(),
                 |lhs, (op, rhs)| Expr::Binary {
                     left: Box::new(lhs),
                     op,
@@ -97,11 +120,11 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                 },
             );
 
-            let add_sub = mul_div.clone().foldl(
+            let add_sub = mul_div_mod.clone().foldl(
                 just(Token::Plus)
                     .to(BinaryOp::Add)
                     .or(just(Token::Minus).to(BinaryOp::Sub))
-                    .then(mul_div.clone())
+                    .then(mul_div_mod.clone())
                     .repeated(),
                 |lhs, (op, rhs)| Expr::Binary {
                     left: Box::new(lhs),
@@ -156,11 +179,19 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
         let if_stmt = just(Token::If)
             .ignore_then(expr.clone())
             .then(block.clone())
+            .then(
+                just(Token::Elsif)
+                    .ignore_then(expr.clone())
+                    .then(block.clone())
+                    .repeated()
+                    .collect::<Vec<_>>()
+            )
             .then(just(Token::Else).ignore_then(block.clone()).or_not())
             .then_ignore(just(Token::End))
-            .map(|((condition, then_branch), else_branch)| Stmt::If {
+            .map(|(((condition, then_branch), elsif_branches), else_branch)| Stmt::If {
                 condition,
                 then_branch,
+                elsif_branches,
                 else_branch,
             });
 

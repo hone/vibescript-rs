@@ -18,6 +18,11 @@ pub enum Expr {
         args: Vec<Expr>,
         kwargs: Vec<(String, Expr)>,
     },
+    Member {
+        receiver: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+    },
     Array(Vec<Expr>),
     Hash(Vec<(String, Expr)>),
 }
@@ -28,6 +33,7 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Modulo,
     Eq,
     NotEq,
     Lt,
@@ -55,6 +61,7 @@ pub enum Stmt {
     If {
         condition: Expr,
         then_branch: Vec<Stmt>,
+        elsif_branches: Vec<(Expr, Vec<Stmt>)>,
         else_branch: Option<Vec<Stmt>>,
     },
     While {

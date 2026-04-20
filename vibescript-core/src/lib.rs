@@ -146,6 +146,34 @@ mod tests {
     }
 
     #[test]
+    fn test_elsif() {
+        let source = "
+            x = 7
+            if x == 1
+                y = 1
+            elsif x == 7
+                y = 7
+            else
+                y = 0
+            end
+            y
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(7));
+    }
+
+    #[test]
+    fn test_member_methods() {
+        let source = "arr = [1, 2, 3]\narr.length()";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(3));
+
+        let source = "\"gwen\".uppercase()";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::String("GWEN".to_string()));
+    }
+
+    #[test]
     fn test_while_loop() {
         let source = "i = 0\nsum = 0\nwhile i < 5\n  i = i + 1\n  sum = sum + i\nend\nsum";
         let result = execute(source).unwrap();

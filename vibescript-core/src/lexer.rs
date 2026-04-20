@@ -47,6 +47,8 @@ pub enum Token {
     Star,
     #[token("/")]
     Slash,
+    #[token("%")]
+    Percent,
     #[token("=")]
     Assign,
     #[token("==")]
@@ -84,4 +86,6 @@ pub enum Token {
     Comma,
     #[token(":")]
     Colon,
+    #[token(".")]
+    Dot,
 }

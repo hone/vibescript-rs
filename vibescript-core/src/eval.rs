@@ -45,15 +45,24 @@ impl Engine {
             Stmt::If {
                 condition,
                 then_branch,
+                elsif_branches,
                 else_branch,
             } => {
                 let cond_val = self.eval_expr_mut(condition)?;
                 if self.is_truthy(&cond_val) {
                     self.eval_block(then_branch)
-                } else if let Some(else_b) = else_branch {
-                    self.eval_block(else_b)
                 } else {
-                    Ok(EvalResult::Value(Value::Nil))
+                    for (elsif_cond, elsif_body) in elsif_branches {
+                        let elsif_val = self.eval_expr_mut(elsif_cond)?;
+                        if self.is_truthy(&elsif_val) {
+                            return self.eval_block(elsif_body);
+                        }
+                    }
+                    if let Some(else_b) = else_branch {
+                        self.eval_block(else_b)
+                    } else {
+                        Ok(EvalResult::Value(Value::Nil))
+                    }
                 }
             }
             Stmt::While { condition, body } => {
@@ -155,6 +164,14 @@ impl Engine {
                 let rhs = self.eval_expr_mut(right)?;
                 self.eval_binary(lhs, *op, rhs)
             }
+            Expr::Member { receiver, method, args } => {
+                let rec_val = self.eval_expr_mut(receiver)?;
+                let mut arg_vals = Vec::new();
+                for arg in args {
+                    arg_vals.push(self.eval_expr_mut(arg)?);
+                }
+                self.eval_member(rec_val, method, arg_vals)
+            }
             Expr::Call { func, args, .. } => {
                 let mut arg_vals = Vec::new();
                 for arg in args {
@@ -176,6 +193,17 @@ impl Engine {
                 }
                 Ok(Value::Hash(hash))
             }
+        }
+    }
+
+    fn eval_member(&self, receiver: Value, method: &str, _args: Vec<Value>) -> Result<Value, String> {
+        match (receiver, method) {
+            (Value::Array(arr), "length") => Ok(Value::Int(arr.len() as i64)),
+            (Value::String(s), "length") => Ok(Value::Int(s.len() as i64)),
+            (Value::Hash(h), "length") => Ok(Value::Int(h.len() as i64)),
+            (Value::String(s), "uppercase") => Ok(Value::String(s.to_uppercase())),
+            (Value::String(s), "lowercase") => Ok(Value::String(s.to_lowercase())),
+            _ => Err(format!("Method '{}' not supported for this type", method)),
         }
     }
 
@@ -262,6 +290,12 @@ impl Engine {
                     l / r
                 };
                 Ok(Value::Int(res))
+            }
+            (Value::Int(l), BinaryOp::Modulo, Value::Int(r)) => {
+                if r == 0 {
+                    return Err("Modulo by zero".to_string());
+                }
+                Ok(Value::Int(l % r))
             }
 
             // Arithmetic - Float & Mixed
