@@ -162,7 +162,29 @@ impl Engine {
                 };
                 Ok(ControlFlow::Return(val))
             }
-            Stmt::Try { .. } => Err("Try statement not yet implemented in evaluator".to_string()),
+            Stmt::Try {
+                body,
+                rescue,
+                ensure,
+            } => {
+                let result = self.eval_block(body);
+                let final_res = match result {
+                    Ok(cf) => Ok(cf),
+                    Err(e) => {
+                        if let Some(rescue_clause) = rescue {
+                            // Simple MVP: rescue all errors
+                            self.eval_block(&rescue_clause.body)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                };
+
+                if let Some(ensure_body) = ensure {
+                    self.eval_block(ensure_body)?;
+                }
+                final_res
+            }
         }
     }
 
@@ -277,8 +299,7 @@ impl Engine {
                         if target_val == val {
                             return match self.eval_block(&clause.body)? {
                                 ControlFlow::Continue(v) => Ok(v),
-                                ControlFlow::Return(v) => Ok(v), // Return from case is Return from surrounding?
-                                // Actually, case is an Expression in Go, so it should just return the value.
+                                ControlFlow::Return(v) => Ok(v),
                                 _ => Err("Control flow in case result not supported".to_string()),
                             };
                         }

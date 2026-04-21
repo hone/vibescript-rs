@@ -29,6 +29,12 @@ pub enum Token {
     Case,
     #[token("when")]
     When,
+    #[token("begin")]
+    Begin,
+    #[token("rescue")]
+    Rescue,
+    #[token("ensure")]
+    Ensure,
     #[token("return")]
     Return,
     #[token("true")]

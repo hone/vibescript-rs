@@ -261,6 +261,25 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
             .ignore_then(expr.clone().or_not())
             .map(Stmt::Return);
 
+        let begin_stmt = just(Token::Begin)
+            .ignore_then(block.clone())
+            .then(
+                just(Token::Rescue)
+                    .ignore_then(
+                        select! { Token::Ident(name) => name }
+                            .separated_by(just(Token::Comma))
+                            .collect::<Vec<_>>()
+                            .delimited_by(just(Token::LParen), just(Token::RParen))
+                            .or_not()
+                    )
+                    .then(block.clone())
+                    .map(|(types, body)| RescueClause { types: types.unwrap_or_default(), body })
+                    .or_not()
+            )
+            .then(just(Token::Ensure).ignore_then(block.clone()).or_not())
+            .then_ignore(just(Token::End))
+            .map(|((body, rescue), ensure)| Stmt::Try { body, rescue, ensure });
+
         choice((
             if_stmt,
             while_stmt,
@@ -270,6 +289,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
             return_stmt,
             break_stmt,
             next_stmt,
+            begin_stmt,
             assignment,
             expr.clone().map(Stmt::Expression),
         ))

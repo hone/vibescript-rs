@@ -305,6 +305,23 @@ mod tests {
         let result = execute(source).unwrap();
         assert_eq!(result, Value::String("two".to_string()));
     }
+
+    #[test]
+    fn test_error_handling() {
+        let source = "
+            x = 0
+            begin
+                1 / 0
+            rescue
+                x = 1
+            ensure
+                x = x + 10
+            end
+            x
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(11));
+    }
 }
 
 export!(MyEngine);
