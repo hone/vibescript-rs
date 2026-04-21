@@ -241,6 +241,70 @@ mod tests {
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Bool(true));
     }
+
+    #[test]
+    fn test_until_loop() {
+        let source = "i = 0\nuntil i == 5\n  i = i + 1\nend\ni";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(5));
+    }
+
+    #[test]
+    fn test_for_loop() {
+        let source = "sum = 0\nfor x in [1, 2, 3]\n  sum = sum + x\nend\nsum";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(6));
+    }
+
+    #[test]
+    fn test_break_next() {
+        let source = "
+            i = 0
+            sum = 0
+            while i < 10
+              i = i + 1
+              if i == 5
+                break
+              end
+              sum = sum + i
+            end
+            sum
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(10)); // 1+2+3+4
+
+        let source = "
+            i = 0
+            sum = 0
+            while i < 5
+              i = i + 1
+              if i == 3
+                next
+              end
+              sum = sum + i
+            end
+            sum
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(12)); // 1+2+4+5
+    }
+
+    #[test]
+    fn test_case_expression() {
+        let source = "
+            x = 2
+            case x
+            when 1
+                \"one\"
+            when 2
+                \"two\"
+            else
+                \"other\"
+            end
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::String("two".to_string()));
+    }
 }
 
 export!(MyEngine);

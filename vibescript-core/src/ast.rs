@@ -25,6 +25,17 @@ pub enum Expr {
     },
     Array(Vec<Expr>),
     Hash(Vec<(String, Expr)>),
+    Case {
+        target: Box<Expr>,
+        clauses: Vec<CaseClause>,
+        else_expr: Option<Vec<Stmt>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseClause {
+    pub values: Vec<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,10 +79,32 @@ pub enum Stmt {
         condition: Expr,
         body: Vec<Stmt>,
     },
+    Until {
+        condition: Expr,
+        body: Vec<Stmt>,
+    },
+    For {
+        var: String,
+        iterable: Expr,
+        body: Vec<Stmt>,
+    },
+    Break,
+    Next,
     Function {
         name: String,
         params: Vec<String>,
         body: Vec<Stmt>,
     },
     Return(Option<Expr>),
+    Try {
+        body: Vec<Stmt>,
+        rescue: Option<RescueClause>,
+        ensure: Option<Vec<Stmt>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RescueClause {
+    pub types: Vec<String>, // Simplified for MVP
+    pub body: Vec<Stmt>,
 }

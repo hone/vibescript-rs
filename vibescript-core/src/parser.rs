@@ -171,7 +171,25 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                 }
             );
 
-            logical_or
+            let case_expr = just(Token::Case)
+                .ignore_then(logical_or.clone().or_not())
+                .then(
+                    just(Token::When)
+                        .ignore_then(logical_or.clone().separated_by(just(Token::Comma)).collect::<Vec<_>>())
+                        .then(stmt.clone().repeated().collect::<Vec<_>>())
+                        .map(|(values, body)| CaseClause { values, body })
+                        .repeated()
+                        .collect::<Vec<_>>()
+                )
+                .then(just(Token::Else).ignore_then(stmt.clone().repeated().collect::<Vec<_>>()).or_not())
+                .then_ignore(just(Token::End))
+                .map(|((target, clauses), else_expr)| Expr::Case {
+                    target: Box::new(target.unwrap_or(Expr::Literal(Value::Bool(true)))),
+                    clauses,
+                    else_expr,
+                });
+
+            case_expr.or(logical_or)
         });
 
         let block = stmt.repeated().collect::<Vec<_>>();
@@ -201,6 +219,20 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
             .then_ignore(just(Token::End))
             .map(|(condition, body)| Stmt::While { condition, body });
 
+        let until_stmt = just(Token::Until)
+            .ignore_then(expr.clone())
+            .then(block.clone())
+            .then_ignore(just(Token::End))
+            .map(|(condition, body)| Stmt::Until { condition, body });
+
+        let for_stmt = just(Token::For)
+            .ignore_then(select! { Token::Ident(name) => name })
+            .then_ignore(just(Token::In))
+            .then(expr.clone())
+            .then(block.clone())
+            .then_ignore(just(Token::End))
+            .map(|((var, iterable), body)| Stmt::For { var, iterable, body });
+
         let def_stmt = just(Token::Def)
             .ignore_then(select! { Token::Ident(name) => name })
             .then(
@@ -222,16 +254,25 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
         .then(expr.clone())
         .map(|(name, value)| Stmt::Assignment { name, value });
 
+        let break_stmt = just(Token::Break).to(Stmt::Break);
+        let next_stmt = just(Token::Next).to(Stmt::Next);
+
         let return_stmt = just(Token::Return)
             .ignore_then(expr.clone().or_not())
             .map(Stmt::Return);
 
-        if_stmt
-            .or(while_stmt)
-            .or(def_stmt)
-            .or(return_stmt)
-            .or(assignment)
-            .or(expr.clone().map(Stmt::Expression))
+        choice((
+            if_stmt,
+            while_stmt,
+            until_stmt,
+            for_stmt,
+            def_stmt,
+            return_stmt,
+            break_stmt,
+            next_stmt,
+            assignment,
+            expr.clone().map(Stmt::Expression),
+        ))
     })
     .repeated()
     .collect::<Vec<_>>()

@@ -15,6 +15,20 @@ pub enum Token {
     End,
     #[token("while")]
     While,
+    #[token("until")]
+    Until,
+    #[token("for")]
+    For,
+    #[token("in")]
+    In,
+    #[token("break")]
+    Break,
+    #[token("next")]
+    Next,
+    #[token("case")]
+    Case,
+    #[token("when")]
+    When,
     #[token("return")]
     Return,
     #[token("true")]

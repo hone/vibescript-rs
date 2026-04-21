@@ -13,8 +13,10 @@ struct FunctionDef {
     body: Vec<Stmt>,
 }
 
-enum EvalResult {
-    Value(Value),
+enum ControlFlow {
+    Continue(Value),
+    Break(Value),
+    Next(Value),
     Return(Value),
 }
 
@@ -29,18 +31,20 @@ impl Engine {
 
     pub fn eval_stmt(&mut self, stmt: &Stmt) -> Result<Value, String> {
         match self.eval_stmt_internal(stmt)? {
-            EvalResult::Value(v) => Ok(v),
-            EvalResult::Return(v) => Ok(v),
+            ControlFlow::Continue(v) => Ok(v),
+            ControlFlow::Break(v) => Ok(v),
+            ControlFlow::Next(v) => Ok(v),
+            ControlFlow::Return(v) => Ok(v),
         }
     }
 
-    fn eval_stmt_internal(&mut self, stmt: &Stmt) -> Result<EvalResult, String> {
+    fn eval_stmt_internal(&mut self, stmt: &Stmt) -> Result<ControlFlow, String> {
         match stmt {
-            Stmt::Expression(expr) => Ok(EvalResult::Value(self.eval_expr_mut(expr)?)),
+            Stmt::Expression(expr) => Ok(ControlFlow::Continue(self.eval_expr_mut(expr)?)),
             Stmt::Assignment { name, value } => {
                 let val = self.eval_expr_mut(value)?;
                 self.set_var(name, val.clone());
-                Ok(EvalResult::Value(val))
+                Ok(ControlFlow::Continue(val))
             }
             Stmt::If {
                 condition,
@@ -61,7 +65,7 @@ impl Engine {
                     if let Some(else_b) = else_branch {
                         self.eval_block(else_b)
                     } else {
-                        Ok(EvalResult::Value(Value::Nil))
+                        Ok(ControlFlow::Continue(Value::Nil))
                     }
                 }
             }
@@ -73,12 +77,73 @@ impl Engine {
                         break;
                     }
                     match self.eval_block(body)? {
-                        EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
-                        EvalResult::Value(v) => last_val = v,
+                        ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
+                        ControlFlow::Break(v) => {
+                            last_val = v;
+                            break;
+                        }
+                        ControlFlow::Next(v) => {
+                            last_val = v;
+                        }
+                        ControlFlow::Continue(v) => {
+                            last_val = v;
+                        }
                     }
                 }
-                Ok(EvalResult::Value(last_val))
+                Ok(ControlFlow::Continue(last_val))
             }
+            Stmt::Until { condition, body } => {
+                let mut last_val = Value::Nil;
+                loop {
+                    let cond_val = self.eval_expr_mut(condition)?;
+                    if self.is_truthy(&cond_val) {
+                        break;
+                    }
+                    match self.eval_block(body)? {
+                        ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
+                        ControlFlow::Break(v) => {
+                            last_val = v;
+                            break;
+                        }
+                        ControlFlow::Next(v) => {
+                            last_val = v;
+                        }
+                        ControlFlow::Continue(v) => {
+                            last_val = v;
+                        }
+                    }
+                }
+                Ok(ControlFlow::Continue(last_val))
+            }
+            Stmt::For {
+                var,
+                iterable,
+                body,
+            } => {
+                let mut last_val = Value::Nil;
+                let iter_val = self.eval_expr_mut(iterable)?;
+                if let Value::Array(arr) = iter_val {
+                    for item in arr {
+                        self.set_var(var, item);
+                        match self.eval_block(body)? {
+                            ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
+                            ControlFlow::Break(v) => {
+                                last_val = v;
+                                break;
+                            }
+                            ControlFlow::Next(v) => {
+                                last_val = v;
+                            }
+                            ControlFlow::Continue(v) => {
+                                last_val = v;
+                            }
+                        }
+                    }
+                }
+                Ok(ControlFlow::Continue(last_val))
+            }
+            Stmt::Break => Ok(ControlFlow::Break(Value::Nil)),
+            Stmt::Next => Ok(ControlFlow::Next(Value::Nil)),
             Stmt::Function { name, params, body } => {
                 self.functions.insert(
                     name.clone(),
@@ -87,7 +152,7 @@ impl Engine {
                         body: body.clone(),
                     },
                 );
-                Ok(EvalResult::Value(Value::Nil))
+                Ok(ControlFlow::Continue(Value::Nil))
             }
             Stmt::Return(expr) => {
                 let val = if let Some(e) = expr {
@@ -95,20 +160,23 @@ impl Engine {
                 } else {
                     Value::Nil
                 };
-                Ok(EvalResult::Return(val))
+                Ok(ControlFlow::Return(val))
             }
+            Stmt::Try { .. } => Err("Try statement not yet implemented in evaluator".to_string()),
         }
     }
 
-    fn eval_block(&mut self, stmts: &[Stmt]) -> Result<EvalResult, String> {
+    fn eval_block(&mut self, stmts: &[Stmt]) -> Result<ControlFlow, String> {
         let mut last_val = Value::Nil;
         for stmt in stmts {
             match self.eval_stmt_internal(stmt)? {
-                EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
-                EvalResult::Value(v) => last_val = v,
+                ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
+                ControlFlow::Break(v) => return Ok(ControlFlow::Break(v)),
+                ControlFlow::Next(v) => return Ok(ControlFlow::Next(v)),
+                ControlFlow::Continue(v) => last_val = v,
             }
         }
-        Ok(EvalResult::Value(last_val))
+        Ok(ControlFlow::Continue(last_val))
     }
 
     fn set_var(&mut self, name: &str, val: Value) {
@@ -164,7 +232,11 @@ impl Engine {
                 let rhs = self.eval_expr_mut(right)?;
                 self.eval_binary(lhs, *op, rhs)
             }
-            Expr::Member { receiver, method, args } => {
+            Expr::Member {
+                receiver,
+                method,
+                args,
+            } => {
                 let rec_val = self.eval_expr_mut(receiver)?;
                 let mut arg_vals = Vec::new();
                 for arg in args {
@@ -193,10 +265,43 @@ impl Engine {
                 }
                 Ok(Value::Hash(hash))
             }
+            Expr::Case {
+                target,
+                clauses,
+                else_expr,
+            } => {
+                let target_val = self.eval_expr_mut(target)?;
+                for clause in clauses {
+                    for val_expr in &clause.values {
+                        let val = self.eval_expr_mut(val_expr)?;
+                        if target_val == val {
+                            return match self.eval_block(&clause.body)? {
+                                ControlFlow::Continue(v) => Ok(v),
+                                ControlFlow::Return(v) => Ok(v), // Return from case is Return from surrounding?
+                                // Actually, case is an Expression in Go, so it should just return the value.
+                                _ => Err("Control flow in case result not supported".to_string()),
+                            };
+                        }
+                    }
+                }
+                if let Some(else_b) = else_expr {
+                    match self.eval_block(else_b)? {
+                        ControlFlow::Continue(v) => Ok(v),
+                        _ => Err("Control flow in case else result not supported".to_string()),
+                    }
+                } else {
+                    Ok(Value::Nil)
+                }
+            }
         }
     }
 
-    fn eval_member(&self, receiver: Value, method: &str, _args: Vec<Value>) -> Result<Value, String> {
+    fn eval_member(
+        &self,
+        receiver: Value,
+        method: &str,
+        _args: Vec<Value>,
+    ) -> Result<Value, String> {
         match (receiver, method) {
             (Value::Array(arr), "length") => Ok(Value::Int(arr.len() as i64)),
             (Value::String(s), "length") => Ok(Value::Int(s.len() as i64)),
@@ -235,8 +340,10 @@ impl Engine {
         self.stack.pop();
 
         match result? {
-            EvalResult::Value(v) => Ok(v),
-            EvalResult::Return(v) => Ok(v),
+            ControlFlow::Return(v) => Ok(v),
+            ControlFlow::Break(v) => Ok(v),
+            ControlFlow::Next(v) => Ok(v),
+            ControlFlow::Continue(v) => Ok(v),
         }
     }
 
@@ -251,15 +358,14 @@ impl Engine {
 
     fn eval_binary(&self, lhs: Value, op: BinaryOp, rhs: Value) -> Result<Value, String> {
         match (lhs, op, rhs) {
-            // Indexing
             (Value::Array(arr), BinaryOp::Index, Value::Int(i)) => {
-                let idx = if i < 0 {
-                    arr.len() as i64 + i
-                } else {
-                    i
-                };
+                let idx = if i < 0 { arr.len() as i64 + i } else { i };
                 if idx < 0 || idx >= arr.len() as i64 {
-                    Err(format!("Array index {} out of bounds (length {})", i, arr.len()))
+                    Err(format!(
+                        "Array index {} out of bounds (length {})",
+                        i,
+                        arr.len()
+                    ))
                 } else {
                     Ok(arr[idx as usize].clone())
                 }
@@ -267,16 +373,12 @@ impl Engine {
             (Value::Hash(hash), BinaryOp::Index, Value::String(s)) => {
                 Ok(hash.get(&s).cloned().unwrap_or(Value::Nil))
             }
-
-            // Comparisons
             (l, BinaryOp::Eq, r) => Ok(Value::Bool(l == r)),
             (l, BinaryOp::NotEq, r) => Ok(Value::Bool(l != r)),
             (Value::Int(l), BinaryOp::Lt, Value::Int(r)) => Ok(Value::Bool(l < r)),
             (Value::Int(l), BinaryOp::LtEq, Value::Int(r)) => Ok(Value::Bool(l <= r)),
             (Value::Int(l), BinaryOp::Gt, Value::Int(r)) => Ok(Value::Bool(l > r)),
             (Value::Int(l), BinaryOp::GtEq, Value::Int(r)) => Ok(Value::Bool(l >= r)),
-
-            // Arithmetic - Int
             (Value::Int(l), BinaryOp::Add, Value::Int(r)) => Ok(Value::Int(l + r)),
             (Value::Int(l), BinaryOp::Sub, Value::Int(r)) => Ok(Value::Int(l - r)),
             (Value::Int(l), BinaryOp::Mul, Value::Int(r)) => Ok(Value::Int(l * r)),
@@ -297,24 +399,18 @@ impl Engine {
                 }
                 Ok(Value::Int(l % r))
             }
-
-            // Arithmetic - Float & Mixed
             (Value::Float(l), BinaryOp::Add, Value::Float(r)) => Ok(Value::Float(l + r)),
             (Value::Float(l), BinaryOp::Add, Value::Int(r)) => Ok(Value::Float(l + r as f64)),
             (Value::Int(l), BinaryOp::Add, Value::Float(r)) => Ok(Value::Float(l as f64 + r)),
-
             (Value::Float(l), BinaryOp::Sub, Value::Float(r)) => Ok(Value::Float(l - r)),
             (Value::Float(l), BinaryOp::Sub, Value::Int(r)) => Ok(Value::Float(l - r as f64)),
             (Value::Int(l), BinaryOp::Sub, Value::Float(r)) => Ok(Value::Float(l as f64 - r)),
-
             (Value::Float(l), BinaryOp::Mul, Value::Float(r)) => Ok(Value::Float(l * r)),
             (Value::Float(l), BinaryOp::Mul, Value::Int(r)) => Ok(Value::Float(l * r as f64)),
             (Value::Int(l), BinaryOp::Mul, Value::Float(r)) => Ok(Value::Float(l as f64 * r)),
-
             (Value::Float(l), BinaryOp::Div, Value::Int(r)) => Ok(Value::Float(l / r as f64)),
             (Value::Int(l), BinaryOp::Div, Value::Float(r)) => Ok(Value::Float(l as f64 / r)),
             (Value::Float(l), BinaryOp::Div, Value::Float(r)) => Ok(Value::Float(l / r)),
-
             _ => Err("Binary operation not supported".to_string()),
         }
     }
