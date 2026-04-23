@@ -1,6 +1,8 @@
 use crate::ast::*;
 use crate::value::Value;
+use chrono::Utc;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 pub struct Engine {
     globals: HashMap<String, Value>,
@@ -172,7 +174,6 @@ impl Engine {
                     Ok(cf) => Ok(cf),
                     Err(e) => {
                         if let Some(rescue_clause) = rescue {
-                            // Simple MVP: rescue all errors
                             self.eval_block(&rescue_clause.body)
                         } else {
                             Err(e)
@@ -258,20 +259,55 @@ impl Engine {
                 receiver,
                 method,
                 args,
+                block,
             } => {
                 let rec_val = self.eval_expr_mut(receiver)?;
                 let mut arg_vals = Vec::new();
                 for arg in args {
                     arg_vals.push(self.eval_expr_mut(arg)?);
                 }
-                self.eval_member(rec_val, method, arg_vals)
+                let block_val = if let Some(b) = block {
+                    Some(self.eval_expr_mut(b)?)
+                } else {
+                    None
+                };
+                self.eval_member_mut(rec_val, method, arg_vals, block_val)
             }
             Expr::Call { func, args, .. } => {
                 let mut arg_vals = Vec::new();
                 for arg in args {
                     arg_vals.push(self.eval_expr_mut(arg)?);
                 }
-                self.call_function(func, arg_vals)
+                match func.as_str() {
+                    "print" => {
+                        for arg in &arg_vals {
+                            print!("{} ", arg.to_string());
+                        }
+                        println!();
+                        Ok(Value::Nil)
+                    }
+                    "now" => Ok(Value::Time(Utc::now())),
+                    "uuid" => Ok(Value::String(Uuid::new_v4().to_string())),
+                    "json_parse" => {
+                        if let Some(Value::String(s)) = arg_vals.first() {
+                            let json_val: serde_json::Value =
+                                serde_json::from_str(s).map_err(|e| e.to_string())?;
+                            Ok(self.json_to_vibe(json_val))
+                        } else {
+                            Err("json_parse expects a string argument".to_string())
+                        }
+                    }
+                    "json_stringify" => {
+                        if let Some(val) = arg_vals.first() {
+                            let json_val = self.vibe_to_json(val.clone());
+                            let s = serde_json::to_string(&json_val).map_err(|e| e.to_string())?;
+                            Ok(Value::String(s))
+                        } else {
+                            Err("json_stringify expects an argument".to_string())
+                        }
+                    }
+                    _ => self.call_function(func, arg_vals),
+                }
             }
             Expr::Array(elements) => {
                 let mut vals = Vec::new();
@@ -314,21 +350,137 @@ impl Engine {
                     Ok(Value::Nil)
                 }
             }
+            Expr::Block { params, body } => Ok(Value::Block {
+                params: params.clone(),
+                body: body.clone(),
+            }),
         }
     }
-
-    fn eval_member(
-        &self,
+    fn json_to_vibe(&self, json: serde_json::Value) -> Value {
+        match json {
+            serde_json::Value::Null => Value::Nil,
+            serde_json::Value::Bool(b) => Value::Bool(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Int(i)
+                } else {
+                    Value::Float(n.as_f64().unwrap_or(0.0))
+                }
+            }
+            serde_json::Value::String(s) => Value::String(s),
+            serde_json::Value::Array(a) => {
+                Value::Array(a.into_iter().map(|v| self.json_to_vibe(v)).collect())
+            }
+            serde_json::Value::Object(o) => {
+                let mut hash = HashMap::new();
+                for (k, v) in o {
+                    hash.insert(k, self.json_to_vibe(v));
+                }
+                Value::Hash(hash)
+            }
+        }
+    }
+    fn vibe_to_json(&self, vibe: Value) -> serde_json::Value {
+        match vibe {
+            Value::Nil => serde_json::Value::Null,
+            Value::Bool(b) => serde_json::Value::Bool(b),
+            Value::Int(i) => serde_json::Value::Number(serde_json::Number::from(i)),
+            Value::Float(f) => {
+                if let Some(n) = serde_json::Number::from_f64(f) {
+                    serde_json::Value::Number(n)
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            Value::String(s) => serde_json::Value::String(s),
+            Value::Time(t) => serde_json::Value::String(t.to_string()),
+            Value::Array(a) => {
+                serde_json::Value::Array(a.into_iter().map(|v| self.vibe_to_json(v)).collect())
+            }
+            Value::Hash(h) => {
+                let mut map = serde_json::Map::new();
+                for (k, v) in h {
+                    map.insert(k, self.vibe_to_json(v));
+                }
+                serde_json::Value::Object(map)
+            }
+            Value::Block { .. } => serde_json::Value::Null,
+        }
+    }
+    fn eval_member_mut(
+        &mut self,
         receiver: Value,
         method: &str,
-        _args: Vec<Value>,
+        args: Vec<Value>,
+        block: Option<Value>,
     ) -> Result<Value, String> {
-        match (receiver, method) {
-            (Value::Array(arr), "length") => Ok(Value::Int(arr.len() as i64)),
-            (Value::String(s), "length") => Ok(Value::Int(s.len() as i64)),
-            (Value::Hash(h), "length") => Ok(Value::Int(h.len() as i64)),
-            (Value::String(s), "uppercase") => Ok(Value::String(s.to_uppercase())),
-            (Value::String(s), "lowercase") => Ok(Value::String(s.to_lowercase())),
+        match (receiver, method, block) {
+            (Value::Array(arr), "length", _) => Ok(Value::Int(arr.len() as i64)),
+            (Value::String(s), "length", _) => Ok(Value::Int(s.len() as i64)),
+            (Value::Hash(h), "length", _) => Ok(Value::Int(h.len() as i64)),
+            (Value::String(s), "uppercase", _) => Ok(Value::String(s.to_uppercase())),
+            (Value::String(s), "lowercase", _) => Ok(Value::String(s.to_lowercase())),
+            (Value::String(s), "split", _) => {
+                if let Some(Value::String(sep)) = args.first() {
+                    let parts = s.split(sep).map(|p| Value::String(p.to_string())).collect();
+                    Ok(Value::Array(parts))
+                } else {
+                    Err("split expects a string separator".to_string())
+                }
+            }
+            // Collection Pipelines
+            (Value::Array(arr), "each", Some(Value::Block { params, body })) => {
+                let mut last_val = Value::Nil;
+                for item in arr {
+                    let mut scope = HashMap::new();
+                    if let Some(param) = params.first() {
+                        scope.insert(param.clone(), item);
+                    }
+                    self.stack.push(scope);
+                    let res = self.eval_block(&body);
+                    self.stack.pop();
+                    match res? {
+                        ControlFlow::Break(v) => {
+                            last_val = v;
+                            break;
+                        }
+                        ControlFlow::Return(v) => return Ok(v),
+                        ControlFlow::Next(v) => {
+                            last_val = v;
+                        }
+                        ControlFlow::Continue(v) => {
+                            last_val = v;
+                        }
+                    }
+                }
+                Ok(last_val)
+            }
+            (Value::Array(arr), "map", Some(Value::Block { params, body })) => {
+                let mut results = Vec::new();
+                for item in arr {
+                    let mut scope = HashMap::new();
+                    if let Some(param) = params.first() {
+                        scope.insert(param.clone(), item);
+                    }
+                    self.stack.push(scope);
+                    let res = self.eval_block(&body);
+                    self.stack.pop();
+                    match res? {
+                        ControlFlow::Break(v) => {
+                            results.push(v);
+                            break;
+                        }
+                        ControlFlow::Return(v) => return Ok(v),
+                        ControlFlow::Next(v) => {
+                            results.push(v);
+                        }
+                        ControlFlow::Continue(v) => {
+                            results.push(v);
+                        }
+                    }
+                }
+                Ok(Value::Array(results))
+            }
             _ => Err(format!("Method '{}' not supported for this type", method)),
         }
     }

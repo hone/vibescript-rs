@@ -2,9 +2,12 @@ use logos::Logos;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(skip r"[ \t\n\f]+")] // Skip whitespace
+#[logos(skip(r"#[^\n]*", allow_greedy = true))] // Skip comments
 pub enum Token {
     #[token("def")]
     Def,
+    #[token("do")]
+    Do,
     #[token("if")]
     If,
     #[token("elsif")]
@@ -55,7 +58,9 @@ pub enum Token {
 
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let s = lex.slice();
-        s[1..s.len()-1].to_string()
+        let content = &s[1..s.len()-1];
+        // Basic unescaping for MVP
+        Some(content.replace("\\\"", "\"").replace("\\n", "\n").replace("\\t", "\t"))
     })]
     String(String),
 
@@ -108,4 +113,6 @@ pub enum Token {
     Colon,
     #[token(".")]
     Dot,
+    #[token("|")]
+    Pipe,
 }

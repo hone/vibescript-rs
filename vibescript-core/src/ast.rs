@@ -17,11 +17,13 @@ pub enum Expr {
         func: String,
         args: Vec<Expr>,
         kwargs: Vec<(String, Expr)>,
+        block: Option<Box<Expr>>, // A block literal
     },
     Member {
         receiver: Box<Expr>,
         method: String,
         args: Vec<Expr>,
+        block: Option<Box<Expr>>, // A block literal
     },
     Array(Vec<Expr>),
     Hash(Vec<(String, Expr)>),
@@ -29,6 +31,10 @@ pub enum Expr {
         target: Box<Expr>,
         clauses: Vec<CaseClause>,
         else_expr: Option<Vec<Stmt>>,
+    },
+    Block {
+        params: Vec<String>,
+        body: Vec<Stmt>,
     },
 }
 
@@ -102,9 +108,8 @@ pub enum Stmt {
         ensure: Option<Vec<Stmt>>,
     },
 }
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct RescueClause {
-    pub types: Vec<String>, // Simplified for MVP
+    pub types: Vec<String>,
     pub body: Vec<Stmt>,
 }

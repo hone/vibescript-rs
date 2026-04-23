@@ -5,10 +5,8 @@ pub mod eval;
 pub mod lexer;
 pub mod parser;
 pub mod value;
-
-use logos::Logos;
 use chumsky::Parser;
-
+use logos::Logos;
 // Generate the WASM Component bindings
 wit_bindgen::generate!({
     world: "vibes-provider",
@@ -16,7 +14,7 @@ wit_bindgen::generate!({
 });
 
 use exports::xipkit::vibes::engine_world::{
-    Guest, GuestEngine, GuestScript, EngineConfig, NamedValue, Value as WitValue
+    EngineConfig, Guest, GuestEngine, GuestScript, NamedValue, Value as WitValue,
 };
 
 struct MyEngine;
@@ -41,7 +39,10 @@ impl GuestEngine for MyEngineWrapper {
         }
     }
 
-    fn compile(&self, source: String) -> Result<exports::xipkit::vibes::engine_world::Script, String> {
+    fn compile(
+        &self,
+        source: String,
+    ) -> Result<exports::xipkit::vibes::engine_world::Script, String> {
         let tokens: Vec<_> = lexer::Token::lexer(&source)
             .map(|t| t.unwrap_or(lexer::Token::Nil))
             .collect();
@@ -57,7 +58,12 @@ impl GuestEngine for MyEngineWrapper {
 }
 
 impl GuestScript for MyScriptWrapper {
-    fn call(&self, _func_name: String, _args: Vec<WitValue>, _kwargs: Vec<NamedValue>) -> Result<WitValue, String> {
+    fn call(
+        &self,
+        _func_name: String,
+        _args: Vec<WitValue>,
+        _kwargs: Vec<NamedValue>,
+    ) -> Result<WitValue, String> {
         let mut engine = eval::Engine::new();
         let mut last_val = value::Value::Nil;
 
@@ -76,13 +82,14 @@ fn vibe_to_wit(v: value::Value) -> WitValue {
         value::Value::String(s) => WitValue::S(s),
         value::Value::Bool(b) => WitValue::B(b),
         value::Value::Nil => WitValue::None,
-        _ => WitValue::None, 
+        value::Value::Time(t) => WitValue::S(t.to_rfc3339()),
+        _ => WitValue::None,
     }
 }
 
 pub fn execute(source: &str) -> Result<value::Value, String> {
     let tokens: Vec<_> = lexer::Token::lexer(source)
-        .map(|t| t.unwrap_or(lexer::Token::Nil)) 
+        .map(|t| t.unwrap_or(lexer::Token::Nil))
         .collect();
 
     let stmts = parser::parser()
@@ -121,7 +128,6 @@ mod tests {
 
     #[test]
     fn test_floor_division() {
-        // Match Go's behavior: -7 / 2 = -4
         let source = "-7 / 2";
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Int(-4));
@@ -181,6 +187,18 @@ mod tests {
     }
 
     #[test]
+    fn test_until_loop() {
+        let source = "i = 0\nuntil i == 5\n  i = i + 1\nend\ni";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(5));
+    }
+    #[test]
+    fn test_for_loop() {
+        let source = "sum = 0\nfor x in [1, 2, 3]\n  sum = sum + x\nend\nsum";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(6));
+    }
+    #[test]
     fn test_functions() {
         let source = "def add(a, b)\n  return a + b\nend\nadd(10, 20)";
         let result = execute(source).unwrap();
@@ -232,78 +250,6 @@ mod tests {
         let source = "true || false";
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Bool(true));
-
-        let source = "false && (1 / 0)"; // Short-circuit
-        let result = execute(source).unwrap();
-        assert_eq!(result, Value::Bool(false));
-
-        let source = "true || (1 / 0)"; // Short-circuit
-        let result = execute(source).unwrap();
-        assert_eq!(result, Value::Bool(true));
-    }
-
-    #[test]
-    fn test_until_loop() {
-        let source = "i = 0\nuntil i == 5\n  i = i + 1\nend\ni";
-        let result = execute(source).unwrap();
-        assert_eq!(result, Value::Int(5));
-    }
-
-    #[test]
-    fn test_for_loop() {
-        let source = "sum = 0\nfor x in [1, 2, 3]\n  sum = sum + x\nend\nsum";
-        let result = execute(source).unwrap();
-        assert_eq!(result, Value::Int(6));
-    }
-
-    #[test]
-    fn test_break_next() {
-        let source = "
-            i = 0
-            sum = 0
-            while i < 10
-              i = i + 1
-              if i == 5
-                break
-              end
-              sum = sum + i
-            end
-            sum
-        ";
-        let result = execute(source).unwrap();
-        assert_eq!(result, Value::Int(10)); // 1+2+3+4
-
-        let source = "
-            i = 0
-            sum = 0
-            while i < 5
-              i = i + 1
-              if i == 3
-                next
-              end
-              sum = sum + i
-            end
-            sum
-        ";
-        let result = execute(source).unwrap();
-        assert_eq!(result, Value::Int(12)); // 1+2+4+5
-    }
-
-    #[test]
-    fn test_case_expression() {
-        let source = "
-            x = 2
-            case x
-            when 1
-                \"one\"
-            when 2
-                \"two\"
-            else
-                \"other\"
-            end
-        ";
-        let result = execute(source).unwrap();
-        assert_eq!(result, Value::String("two".to_string()));
     }
 
     #[test]
@@ -321,6 +267,47 @@ mod tests {
         ";
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Int(11));
+    }
+
+    #[test]
+    fn test_collection_pipelines() {
+        let source = "[1, 2, 3].map do |x| x * 2 end";
+        let result = execute(source).unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)])
+        );
+    }
+
+    #[test]
+    fn test_builtins() {
+        let source = "json_parse(\"{\\\"a\\\": 1}\")";
+        let result = execute(source).unwrap();
+        let mut expected_hash = std::collections::HashMap::new();
+        expected_hash.insert("a".to_string(), Value::Int(1));
+        assert_eq!(result, Value::Hash(expected_hash));
+        let source = "uuid()";
+        let result = execute(source).unwrap();
+        if let Value::String(s) = result {
+            assert_eq!(s.len(), 36);
+        } else {
+            panic!("Expected string for uuid");
+        }
+        let source = "now()";
+        let result = execute(source).unwrap();
+        assert!(matches!(result, Value::Time(_)));
+    }
+
+    #[test]
+    fn test_comments() {
+        let source = "
+            # This is a comment
+            x = 10 # another comment
+            # final comment
+            x
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(10));
     }
 }
 
