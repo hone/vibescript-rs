@@ -394,6 +394,98 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn test_classes() {
+        let source = "
+            class User
+                def initialize(@name, @age)
+                end
+
+                def greet
+                    return \"Hello, I am \" + @name + \" and I am \" + @age.to_string() + \" years old.\"
+                end
+
+                def birthday
+                    @age = @age + 1
+                end
+            end
+
+            u = User.new(\"Gwen\", 25)
+            u.birthday()
+            u.greet()
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(
+            result,
+            Value::String("Hello, I am Gwen and I am 26 years old.".to_string())
+        );
+
+        // Test multiple instances and state isolation
+        let source = "
+            class Counter
+                def initialize(@count)
+                end
+                def inc
+                    @count = @count + 1
+                end
+                def val
+                    return @count
+                end
+            end
+
+            c1 = Counter.new(10)
+            c2 = Counter.new(20)
+            c1.inc()
+            c1.val() + c2.val()
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(31));
+    }
+
+    #[test]
+    fn test_advanced_classes() {
+        let source = "
+            class Account
+                property balance
+
+                def initialize(@balance)
+                end
+
+                private def secret
+                    return \"42\"
+                end
+
+                def get_secret
+                    return secret()
+                end
+            end
+
+            a = Account.new(100)
+            a.balance = a.balance() + 50
+
+            # This should work (internal call)
+            s = a.get_secret()
+
+            a.balance()
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(150));
+
+        // Test privacy violation
+        let source = "
+            class Account
+                private def secret
+                    return \"42\"
+                end
+            end
+            a = Account.new()
+            a.secret()
+        ";
+        let res = execute(source);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("private"));
+    }
 }
 
 export!(MyEngine);

@@ -40,6 +40,18 @@ pub enum Token {
     Ensure,
     #[token("enum")]
     Enum,
+    #[token("class")]
+    Class,
+    #[token("self")]
+    SelfToken,
+    #[token("property")]
+    Property,
+    #[token("getter")]
+    Getter,
+    #[token("setter")]
+    Setter,
+    #[token("private")]
+    Private,
     #[token("return")]
     Return,
     #[token("true")]
@@ -51,6 +63,12 @@ pub enum Token {
 
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*\\??", |lex| lex.slice().to_string())]
     Ident(String),
+
+    #[regex("@[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[1..].to_string())]
+    Ivar(String),
+
+    #[regex("@@[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[2..].to_string())]
+    Cvar(String),
 
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     Int(i64),

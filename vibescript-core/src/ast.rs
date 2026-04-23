@@ -1,9 +1,11 @@
-use crate::value::Value;
+use crate::value::{EnumMember, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Value),
     Variable(String),
+    InstanceVar(String),
+    ClassVar(String),
     Binary {
         left: Box<Expr>,
         op: BinaryOp,
@@ -82,6 +84,14 @@ pub enum Stmt {
         name: String,
         value: Expr,
     },
+    IvarAssignment {
+        name: String,
+        value: Expr,
+    },
+    CvarAssignment {
+        name: String,
+        value: Expr,
+    },
     If {
         condition: Expr,
         then_branch: Vec<Stmt>,
@@ -103,14 +113,18 @@ pub enum Stmt {
     },
     Break,
     Next,
-    Function {
-        name: String,
-        params: Vec<String>,
-        body: Vec<Stmt>,
-    },
+    Function(FunctionStmt),
     EnumDef {
         name: String,
         members: Vec<EnumMember>,
+    },
+    ClassDef {
+        name: String,
+        body: Vec<Stmt>,
+    },
+    PropertyDecl {
+        names: Vec<String>,
+        kind: PropertyKind,
     },
     Return(Option<Expr>),
     Try {
@@ -120,9 +134,20 @@ pub enum Stmt {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PropertyKind {
+    Property,
+    Getter,
+    Setter,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct EnumMember {
+pub struct FunctionStmt {
     pub name: String,
+    pub params: Vec<crate::value::Param>,
+    pub body: Vec<Stmt>,
+    pub is_class_method: bool,
+    pub is_private: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

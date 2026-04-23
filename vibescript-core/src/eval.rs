@@ -1,19 +1,16 @@
 use crate::ast::*;
-use crate::value::Value;
+use crate::value::{ClassDef, FunctionDef, InstanceData, Param, Value};
 use chrono::Utc;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 pub struct Engine {
     globals: HashMap<String, Value>,
     functions: HashMap<String, FunctionDef>,
     enums: HashMap<String, EnumDef>,
+    classes: HashMap<String, Arc<ClassDef>>,
     stack: Vec<HashMap<String, Value>>,
-}
-
-struct FunctionDef {
-    params: Vec<String>,
-    body: Vec<Stmt>,
 }
 
 struct EnumDef {
@@ -33,6 +30,7 @@ impl Engine {
             globals: HashMap::new(),
             functions: HashMap::new(),
             enums: HashMap::new(),
+            classes: HashMap::new(),
             stack: vec![HashMap::new()], // Root scope
         }
     }
@@ -52,6 +50,16 @@ impl Engine {
             Stmt::Assignment { name, value } => {
                 let val = self.eval_expr_mut(value)?;
                 self.set_var(name, val.clone());
+                Ok(ControlFlow::Continue(val))
+            }
+            Stmt::IvarAssignment { name, value } => {
+                let val = self.eval_expr_mut(value)?;
+                self.set_ivar(name, val.clone())?;
+                Ok(ControlFlow::Continue(val))
+            }
+            Stmt::CvarAssignment { name, value } => {
+                let val = self.eval_expr_mut(value)?;
+                self.set_cvar(name, val.clone())?;
                 Ok(ControlFlow::Continue(val))
             }
             Stmt::If {
@@ -152,12 +160,13 @@ impl Engine {
             }
             Stmt::Break => Ok(ControlFlow::Break(Value::Nil)),
             Stmt::Next => Ok(ControlFlow::Next(Value::Nil)),
-            Stmt::Function { name, params, body } => {
+            Stmt::Function(f) => {
                 self.functions.insert(
-                    name.clone(),
+                    f.name.clone(),
                     FunctionDef {
-                        params: params.clone(),
-                        body: body.clone(),
+                        params: f.params.clone(),
+                        body: f.body.clone(),
+                        is_private: f.is_private,
                     },
                 );
                 Ok(ControlFlow::Continue(Value::Nil))
@@ -170,6 +179,13 @@ impl Engine {
                     },
                 );
                 Ok(ControlFlow::Continue(Value::Nil))
+            }
+            Stmt::ClassDef { name, body } => {
+                self.eval_class_def(name, body)?;
+                Ok(ControlFlow::Continue(Value::Nil))
+            }
+            Stmt::PropertyDecl { .. } => {
+                Err("PropertyDecl only supported inside class definition".to_string())
             }
             Stmt::Return(expr) => {
                 let val = if let Some(e) = expr {
@@ -232,6 +248,39 @@ impl Engine {
         self.globals.get(name).cloned()
     }
 
+    fn set_ivar(&mut self, name: &str, val: Value) -> Result<(), String> {
+        let self_val = self.get_var("self").ok_or("No 'self' in current scope")?;
+        if let Value::Instance(inst) = self_val {
+            inst.write().unwrap().ivars.insert(name.to_string(), val);
+            Ok(())
+        } else {
+            Err("'self' is not an instance".to_string())
+        }
+    }
+
+    fn get_ivar(&self, name: &str) -> Result<Value, String> {
+        let self_val = self.get_var("self").ok_or("No 'self' in current scope")?;
+        if let Value::Instance(inst) = self_val {
+            Ok(inst
+                .read()
+                .unwrap()
+                .ivars
+                .get(name)
+                .cloned()
+                .unwrap_or(Value::Nil))
+        } else {
+            Err("'self' is not an instance".to_string())
+        }
+    }
+
+    fn set_cvar(&mut self, _name: &str, _val: Value) -> Result<(), String> {
+        Err("Class variables not fully implemented in MVP".to_string())
+    }
+
+    fn get_cvar(&self, _name: &str) -> Result<Value, String> {
+        Err("Class variables not fully implemented in MVP".to_string())
+    }
+
     fn is_truthy(&self, val: &Value) -> bool {
         match val {
             Value::Nil => false,
@@ -247,12 +296,16 @@ impl Engine {
                 if let Some(val) = self.get_var(name) {
                     return Ok(val);
                 }
-                // Check if it's an enum name being referenced
+                if let Some(c) = self.classes.get(name) {
+                    return Ok(Value::Class(c.clone()));
+                }
                 if self.enums.contains_key(name) {
-                    return Ok(Value::String(format!("ENUM:{}", name))); // Marker value for enum access
+                    return Ok(Value::String(format!("ENUM:{}", name)));
                 }
                 Err(format!("Variable '{}' not found", name))
             }
+            Expr::InstanceVar(name) => self.get_ivar(name),
+            Expr::ClassVar(name) => self.get_cvar(name),
             Expr::Unary { op, expr } => {
                 let val = self.eval_expr_mut(expr)?;
                 self.eval_unary(*op, &val)
@@ -285,7 +338,6 @@ impl Engine {
             } => {
                 let rec_val = self.eval_expr_mut(receiver)?;
 
-                // Special case: Enum Variant Access (e.g., Color.Red)
                 if let Value::String(s) = &rec_val {
                     if let Some(enum_name) = s.strip_prefix("ENUM:") {
                         if let Some(enum_def) = self.enums.get(enum_name) {
@@ -343,7 +395,24 @@ impl Engine {
                             Err("json_stringify expects an argument".to_string())
                         }
                     }
-                    _ => self.call_function(func, arg_vals),
+                    _ => {
+                        // Method Resolution Logic for local calls
+                        let current_self = self.get_var("self");
+                        if let Some(Value::Instance(inst)) = current_self {
+                            let class_def = inst.read().unwrap().class.clone();
+                            if let Some(fn_def) = class_def.methods.get(func) {
+                                // Calling a local method within 'self' context
+                                self.stack.push(HashMap::from([(
+                                    "self".to_string(),
+                                    Value::Instance(inst.clone()),
+                                )]));
+                                let res = self.call_function_def(fn_def, arg_vals)?;
+                                self.stack.pop();
+                                return Ok(res);
+                            }
+                        }
+                        self.call_function(func, arg_vals)
+                    }
                 }
             }
             Expr::Array(elements) => {
@@ -461,6 +530,83 @@ impl Engine {
                 serde_json::Value::Object(map)
             }
             Value::Block { .. } => serde_json::Value::Null,
+            Value::Class(c) => serde_json::Value::String(format!("<class {}>", c.name)),
+            Value::Instance(i) => {
+                serde_json::Value::String(format!("<instance of {}>", i.read().unwrap().class.name))
+            }
+        }
+    }
+
+    fn eval_class_def(&mut self, name: &str, body: &[Stmt]) -> Result<(), String> {
+        let mut class_methods = HashMap::new();
+        let mut methods = HashMap::new();
+
+        for stmt in body {
+            match stmt {
+                Stmt::Function(f) => {
+                    let def = FunctionDef {
+                        params: f.params.clone(),
+                        body: f.body.clone(),
+                        is_private: f.is_private,
+                    };
+                    if f.is_class_method {
+                        class_methods.insert(f.name.clone(), def);
+                    } else {
+                        methods.insert(f.name.clone(), def);
+                    }
+                }
+                Stmt::PropertyDecl { names, kind } => {
+                    for prop_name in names {
+                        match kind {
+                            PropertyKind::Property => {
+                                methods.insert(prop_name.clone(), self.make_getter(prop_name));
+                                methods
+                                    .insert(format!("{}=", prop_name), self.make_setter(prop_name));
+                            }
+                            PropertyKind::Getter => {
+                                methods.insert(prop_name.clone(), self.make_getter(prop_name));
+                            }
+                            PropertyKind::Setter => {
+                                methods
+                                    .insert(format!("{}=", prop_name), self.make_setter(prop_name));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let class_def = Arc::new(ClassDef {
+            name: name.to_string(),
+            methods,
+            class_methods,
+            class_vars: RwLock::new(HashMap::new()),
+        });
+
+        self.classes.insert(name.to_string(), class_def);
+        Ok(())
+    }
+
+    fn make_getter(&self, name: &str) -> FunctionDef {
+        FunctionDef {
+            params: vec![],
+            body: vec![Stmt::Expression(Expr::InstanceVar(name.to_string()))],
+            is_private: false,
+        }
+    }
+
+    fn make_setter(&self, name: &str) -> FunctionDef {
+        FunctionDef {
+            params: vec![Param {
+                name: "val".to_string(),
+                is_ivar: false,
+            }],
+            body: vec![Stmt::IvarAssignment {
+                name: name.to_string(),
+                value: Expr::Variable("val".to_string()),
+            }],
+            is_private: false,
         }
     }
 
@@ -471,10 +617,56 @@ impl Engine {
         args: Vec<Value>,
         block: Option<Value>,
     ) -> Result<Value, String> {
-        match (receiver, method, block) {
+        match (receiver.clone(), method, block) {
+            (Value::Class(c), "new", _) => {
+                let instance = Arc::new(RwLock::new(InstanceData {
+                    class: c.clone(),
+                    ivars: HashMap::new(),
+                }));
+                let inst_val = Value::Instance(instance);
+
+                if let Some(init_fn) = c.methods.get("initialize") {
+                    self.stack
+                        .push(HashMap::from([("self".to_string(), inst_val.clone())]));
+                    self.call_function_def(init_fn, args)?;
+                    self.stack.pop();
+                }
+                Ok(inst_val)
+            }
+            (Value::Instance(inst), method_name, _) => {
+                let class_def = inst.read().unwrap().class.clone();
+                if let Some(fn_def) = class_def.methods.get(method_name) {
+                    if fn_def.is_private {
+                        let current_self = self.get_var("self");
+                        let is_internal = if let Some(Value::Instance(curr)) = current_self {
+                            Arc::ptr_eq(&curr, &inst)
+                        } else {
+                            false
+                        };
+                        if !is_internal {
+                            return Err(format!("Method '{}' is private", method_name));
+                        }
+                    }
+
+                    self.stack.push(HashMap::from([(
+                        "self".to_string(),
+                        Value::Instance(inst.clone()),
+                    )]));
+                    let res = self.call_function_def(fn_def, args)?;
+                    self.stack.pop();
+                    Ok(res)
+                } else {
+                    Err(format!(
+                        "Method '{}' not found in class {}",
+                        method_name, class_def.name
+                    ))
+                }
+            }
             (Value::Array(arr), "length" | "size", _) => Ok(Value::Int(arr.len() as i64)),
             (Value::String(s), "length" | "size", _) => Ok(Value::Int(s.len() as i64)),
             (Value::Hash(h), "length" | "size", _) => Ok(Value::Int(h.len() as i64)),
+
+            (_, "to_string", _) => Ok(Value::String(receiver.to_string())),
 
             (Value::String(s), "uppercase", _) => Ok(Value::String(s.to_uppercase())),
             (Value::String(s), "lowercase", _) => Ok(Value::String(s.to_lowercase())),
@@ -683,30 +875,41 @@ impl Engine {
     }
 
     fn call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
-        let (params, body) = {
-            let func = self
-                .functions
-                .get(name)
-                .ok_or_else(|| format!("Function '{}' not found", name))?;
+        let fn_def = self
+            .functions
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("Function '{}' not found", name))?;
 
-            if args.len() != func.params.len() {
-                return Err(format!(
-                    "Function '{}' expected {} args, got {}",
-                    name,
-                    func.params.len(),
-                    args.len()
-                ));
-            }
-            (func.params.clone(), func.body.clone())
-        };
+        if fn_def.is_private {
+            return Err(format!("Function '{}' is private", name));
+        }
+
+        self.call_function_def(&fn_def, args)
+    }
+
+    fn call_function_def(&mut self, func: &FunctionDef, args: Vec<Value>) -> Result<Value, String> {
+        if args.len() != func.params.len() {
+            return Err(format!(
+                "Expected {} args, got {}",
+                func.params.len(),
+                args.len()
+            ));
+        }
 
         let mut new_scope = HashMap::new();
-        for (param, val) in params.iter().zip(args) {
-            new_scope.insert(param.clone(), val);
+        for (param, val) in func.params.iter().zip(args) {
+            new_scope.insert(param.name.clone(), val.clone());
+            // If the parameter is an ivar, set it on self
+            if param.is_ivar {
+                self.stack.push(new_scope.clone()); // Temporary push to have 'self' if it exists
+                self.set_ivar(&param.name, val.clone())?;
+                new_scope = self.stack.pop().unwrap();
+            }
         }
 
         self.stack.push(new_scope);
-        let result = self.eval_block(&body);
+        let result = self.eval_block(&func.body);
         self.stack.pop();
 
         match result? {

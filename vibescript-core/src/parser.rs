@@ -1,16 +1,23 @@
 use crate::ast::*;
 use crate::lexer::Token;
-use crate::value::Value;
+use crate::value::{EnumMember, Param, Value};
 use chumsky::prelude::*;
 use logos::Logos;
 
 pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'a, Token>>> {
+    stmt_parser()
+        .repeated()
+        .collect::<Vec<_>>()
+        .then_ignore(end())
+}
+
+fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, extra::Err<Rich<'a, Token>>> {
     recursive(|stmt| {
         let block_body = stmt.clone().repeated().collect::<Vec<_>>();
 
         let block_lit = just(Token::Do)
             .ignore_then(
-                select! { Token::Ident(name) => name }
+                select! { Token::Ident(name) => name, Token::Ivar(name) => format!("@{}", name) }
                     .separated_by(just(Token::Comma))
                     .allow_trailing()
                     .collect::<Vec<_>>()
@@ -41,7 +48,6 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                             let inner_tokens: Vec<_> = Token::lexer(inner)
                                 .map(|t| t.unwrap_or(Token::Nil))
                                 .collect();
-                            // Use a fresh parser for interpolation to break type recursion
                             if let Ok(inner_stmts) = parser().parse(&inner_tokens).into_result() {
                                 if let Some(Stmt::Expression(inner_expr)) = inner_stmts.first() {
                                     parts.push(StringPart::Expr(inner_expr.clone()));
@@ -73,6 +79,8 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
 
             let variable = select! {
                 Token::Ident(name) => Expr::Variable(name),
+                Token::Ivar(name) => Expr::InstanceVar(name),
+                Token::Cvar(name) => Expr::ClassVar(name),
             };
 
             let array = expr
@@ -127,9 +135,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                                 .or_not(),
                         )
                         .then(block_lit.clone().or_not())
-                        .map(|((name, args), block)| {
-                            ("member", args.unwrap_or_default(), name, block)
-                        }),
+                        .map(|((name, args), block)| ("member", args.unwrap_or_default(), name, block)),
                 ))
                 .repeated(),
                 |lhs, (kind, args, name, block)| match kind {
@@ -256,7 +262,11 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                         .repeated()
                         .collect::<Vec<_>>(),
                 )
-                .then(just(Token::Else).ignore_then(block_body.clone()).or_not())
+                .then(
+                    just(Token::Else)
+                        .ignore_then(block_body.clone())
+                        .or_not(),
+                )
                 .then_ignore(just(Token::End))
                 .map(|((target, clauses), else_expr)| Expr::Case {
                     target: Box::new(target.unwrap_or(Expr::Literal(Value::Bool(true)))),
@@ -312,36 +322,92 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
                 body,
             });
 
-        let def_stmt = just(Token::Def)
-            .ignore_then(select! { Token::Ident(name) => name })
+        let def_stmt = just(Token::Private).or_not()
+            .then_ignore(just(Token::Def))
             .then(
-                select! { Token::Ident(name) => name }
-                    .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .or(empty().to(vec![])),
+                choice((
+                    just(Token::SelfToken)
+                        .ignore_then(just(Token::Dot))
+                        .ignore_then(select! { Token::Ident(name) => name })
+                        .map(|name| (name, true)),
+                    select! { Token::Ident(name) => name }.map(|name| (name, false)),
+                ))
+            )
+            .then(
+                choice((
+                    select! { Token::Ident(name) => Param { name, is_ivar: false }, Token::Ivar(name) => Param { name, is_ivar: true } }
+                        .separated_by(just(Token::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(just(Token::LParen), just(Token::RParen)),
+                    empty().to(vec![]),
+                ))
             )
             .then(block_body.clone())
             .then_ignore(just(Token::End))
-            .map(|((name, params), body)| Stmt::Function { name, params, body });
+            .map(|(((is_private, (name, is_class_method)), params), body)| Stmt::Function(FunctionStmt {
+                name,
+                params,
+                body,
+                is_class_method,
+                is_private: is_private.is_some(),
+            }));
 
         let enum_stmt = just(Token::Enum)
             .ignore_then(select! { Token::Ident(name) => name })
             .then(
                 select! { Token::Ident(name) => EnumMember { name } }
                     .repeated()
-                    .collect::<Vec<_>>(),
+                    .collect::<Vec<_>>()
             )
             .then_ignore(just(Token::End))
             .map(|(name, members)| Stmt::EnumDef { name, members });
 
-        let assignment = select! {
-            Token::Ident(name) => name,
-        }
-        .then_ignore(just(Token::Assign))
-        .then(expr.clone())
-        .map(|(name, value)| Stmt::Assignment { name, value });
+        let class_stmt = just(Token::Class)
+            .ignore_then(select! { Token::Ident(name) => name })
+            .then(block_body.clone())
+            .then_ignore(just(Token::End))
+            .map(|(name, body)| Stmt::ClassDef { name, body });
+
+        let property_stmt = choice((
+            just(Token::Property).to(PropertyKind::Property),
+            just(Token::Getter).to(PropertyKind::Getter),
+            just(Token::Setter).to(PropertyKind::Setter),
+        ))
+        .then(
+            select! { Token::Ident(name) => name }
+                .separated_by(just(Token::Comma))
+                .collect::<Vec<_>>()
+        )
+        .map(|(kind, names)| Stmt::PropertyDecl { names, kind });
+
+        let assignment = choice((
+            // High priority: Member Assignment obj.prop = val
+            // We use a restricted "atom" here to avoid full expression recursion at the start of assignment
+            select! { Token::Ident(name) => name }
+                .then_ignore(just(Token::Dot))
+                .then(select! { Token::Ident(name) => name })
+                .then_ignore(just(Token::Assign))
+                .then(expr.clone())
+                .map(|((receiver, method), value)| Stmt::Expression(Expr::Member {
+                    receiver: Box::new(Expr::Variable(receiver)),
+                    method: format!("{}=", method),
+                    args: vec![value],
+                    block: None,
+                })),
+            select! { Token::Ident(name) => name }
+                .then_ignore(just(Token::Assign))
+                .then(expr.clone())
+                .map(|(name, value)| Stmt::Assignment { name, value }),
+            select! { Token::Ivar(name) => name }
+                .then_ignore(just(Token::Assign))
+                .then(expr.clone())
+                .map(|(name, value)| Stmt::IvarAssignment { name, value }),
+            select! { Token::Cvar(name) => name }
+                .then_ignore(just(Token::Assign))
+                .then(expr.clone())
+                .map(|(name, value)| Stmt::CvarAssignment { name, value }),
+        ));
 
         let break_stmt = just(Token::Break).to(Stmt::Break);
         let next_stmt = just(Token::Next).to(Stmt::Next);
@@ -383,6 +449,8 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
             for_stmt,
             def_stmt,
             enum_stmt,
+            class_stmt,
+            property_stmt,
             return_stmt,
             break_stmt,
             next_stmt,
@@ -390,8 +458,5 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
             assignment,
             expr.clone().map(Stmt::Expression),
         ))
-    })
-    .repeated()
-    .collect::<Vec<_>>()
-    .then_ignore(end())
+    }).boxed()
 }
