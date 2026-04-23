@@ -7,12 +7,17 @@ use uuid::Uuid;
 pub struct Engine {
     globals: HashMap<String, Value>,
     functions: HashMap<String, FunctionDef>,
+    enums: HashMap<String, EnumDef>,
     stack: Vec<HashMap<String, Value>>,
 }
 
 struct FunctionDef {
     params: Vec<String>,
     body: Vec<Stmt>,
+}
+
+struct EnumDef {
+    members: Vec<String>,
 }
 
 enum ControlFlow {
@@ -27,6 +32,7 @@ impl Engine {
         Self {
             globals: HashMap::new(),
             functions: HashMap::new(),
+            enums: HashMap::new(),
             stack: vec![HashMap::new()], // Root scope
         }
     }
@@ -156,6 +162,15 @@ impl Engine {
                 );
                 Ok(ControlFlow::Continue(Value::Nil))
             }
+            Stmt::EnumDef { name, members } => {
+                self.enums.insert(
+                    name.clone(),
+                    EnumDef {
+                        members: members.iter().map(|m| m.name.clone()).collect(),
+                    },
+                );
+                Ok(ControlFlow::Continue(Value::Nil))
+            }
             Stmt::Return(expr) => {
                 let val = if let Some(e) = expr {
                     self.eval_expr_mut(e)?
@@ -228,9 +243,16 @@ impl Engine {
     pub fn eval_expr_mut(&mut self, expr: &Expr) -> Result<Value, String> {
         match expr {
             Expr::Literal(val) => Ok(val.clone()),
-            Expr::Variable(name) => self
-                .get_var(name)
-                .ok_or_else(|| format!("Variable '{}' not found", name)),
+            Expr::Variable(name) => {
+                if let Some(val) = self.get_var(name) {
+                    return Ok(val);
+                }
+                // Check if it's an enum name being referenced
+                if self.enums.contains_key(name) {
+                    return Ok(Value::String(format!("ENUM:{}", name))); // Marker value for enum access
+                }
+                Err(format!("Variable '{}' not found", name))
+            }
             Expr::Unary { op, expr } => {
                 let val = self.eval_expr_mut(expr)?;
                 self.eval_unary(*op, &val)
@@ -262,6 +284,21 @@ impl Engine {
                 block,
             } => {
                 let rec_val = self.eval_expr_mut(receiver)?;
+
+                // Special case: Enum Variant Access (e.g., Color.Red)
+                if let Value::String(s) = &rec_val {
+                    if let Some(enum_name) = s.strip_prefix("ENUM:") {
+                        if let Some(enum_def) = self.enums.get(enum_name) {
+                            if enum_def.members.contains(&method.to_string()) {
+                                return Ok(Value::EnumVariant {
+                                    enum_name: enum_name.to_string(),
+                                    variant_name: method.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 let mut arg_vals = Vec::new();
                 for arg in args {
                     arg_vals.push(self.eval_expr_mut(arg)?);
@@ -409,6 +446,10 @@ impl Engine {
             }
             Value::String(s) => serde_json::Value::String(s),
             Value::Time(t) => serde_json::Value::String(t.to_rfc3339()),
+            Value::EnumVariant {
+                enum_name,
+                variant_name,
+            } => serde_json::Value::String(format!("{}.{}", enum_name, variant_name)),
             Value::Array(a) => {
                 serde_json::Value::Array(a.into_iter().map(|v| self.vibe_to_json(v)).collect())
             }

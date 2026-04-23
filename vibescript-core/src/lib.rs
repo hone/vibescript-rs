@@ -5,8 +5,10 @@ pub mod eval;
 pub mod lexer;
 pub mod parser;
 pub mod value;
+
 use chumsky::Parser;
 use logos::Logos;
+
 // Generate the WASM Component bindings
 wit_bindgen::generate!({
     world: "vibes-provider",
@@ -83,6 +85,10 @@ fn vibe_to_wit(v: value::Value) -> WitValue {
         value::Value::Bool(b) => WitValue::B(b),
         value::Value::Nil => WitValue::None,
         value::Value::Time(t) => WitValue::S(t.to_rfc3339()),
+        value::Value::EnumVariant {
+            enum_name,
+            variant_name,
+        } => WitValue::S(format!("{}.{}", enum_name, variant_name)),
         _ => WitValue::None,
     }
 }
@@ -192,12 +198,14 @@ mod tests {
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Int(5));
     }
+
     #[test]
     fn test_for_loop() {
         let source = "sum = 0\nfor x in [1, 2, 3]\n  sum = sum + x\nend\nsum";
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Int(6));
     }
+
     #[test]
     fn test_functions() {
         let source = "def add(a, b)\n  return a + b\nend\nadd(10, 20)";
@@ -365,6 +373,26 @@ mod tests {
         let source = "\"Total: #{1 + 2 * 3}\"";
         let result = execute(source).unwrap();
         assert_eq!(result, Value::String("Total: 7".to_string()));
+    }
+
+    #[test]
+    fn test_enums() {
+        let source = "
+            enum Color
+                Red
+                Green
+                Blue
+            end
+            Color.Red
+        ";
+        let result = execute(source).unwrap();
+        assert_eq!(
+            result,
+            Value::EnumVariant {
+                enum_name: "Color".to_string(),
+                variant_name: "Red".to_string(),
+            }
+        );
     }
 }
 

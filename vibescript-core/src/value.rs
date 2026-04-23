@@ -12,6 +12,10 @@ pub enum Value {
     Float(f64),
     String(String),
     Time(DateTime<Utc>),
+    EnumVariant {
+        enum_name: String,
+        variant_name: String,
+    },
     Array(Vec<Value>),
     Hash(HashMap<String, Value>),
     #[serde(skip)]
@@ -41,6 +45,7 @@ impl Value {
             _ => None,
         }
     }
+
     pub fn to_string(&self) -> String {
         match self {
             Value::Nil => "nil".to_string(),
@@ -49,6 +54,10 @@ impl Value {
             Value::Float(f) => f.to_string(),
             Value::String(s) => s.clone(),
             Value::Time(t) => t.to_rfc3339(),
+            Value::EnumVariant {
+                enum_name,
+                variant_name,
+            } => format!("{}.{}", enum_name, variant_name),
             Value::Array(a) => format!("{:?}", a),
             Value::Hash(h) => format!("{:?}", h),
             Value::Block { .. } => "block".to_string(),

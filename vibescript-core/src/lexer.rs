@@ -38,6 +38,8 @@ pub enum Token {
     Rescue,
     #[token("ensure")]
     Ensure,
+    #[token("enum")]
+    Enum,
     #[token("return")]
     Return,
     #[token("true")]

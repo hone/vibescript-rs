@@ -108,12 +108,21 @@ pub enum Stmt {
         params: Vec<String>,
         body: Vec<Stmt>,
     },
+    EnumDef {
+        name: String,
+        members: Vec<EnumMember>,
+    },
     Return(Option<Expr>),
     Try {
         body: Vec<Stmt>,
         rescue: Option<RescueClause>,
         ensure: Option<Vec<Stmt>>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumMember {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
