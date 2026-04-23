@@ -277,6 +277,52 @@ mod tests {
             result,
             Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)])
         );
+
+        let source = "[1, 2, 3, 4].select do |x| x > 2 end";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Array(vec![Value::Int(3), Value::Int(4)]));
+
+        let source = "[1, 2, 3].reduce(10) do |acc, x| acc + x end";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::Int(16));
+    }
+
+    #[test]
+    fn test_extended_stdlib() {
+        // String
+        let source = "\"hello\".contains?(\"ell\")";
+        assert_eq!(execute(source).unwrap(), Value::Bool(true));
+
+        let source = "\"abc\" + \"def\"";
+        assert_eq!(
+            execute(source).unwrap(),
+            Value::String("abcdef".to_string())
+        );
+
+        // Array
+        let source = "[1, 2].push(3, 4)";
+        assert_eq!(
+            execute(source).unwrap(),
+            Value::Array(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4)
+            ])
+        );
+
+        let source = "[1, 2, 3].include?(2)";
+        assert_eq!(execute(source).unwrap(), Value::Bool(true));
+
+        let source = "[1, 2, 3].join(\"-\")";
+        assert_eq!(execute(source).unwrap(), Value::String("1-2-3".to_string()));
+
+        // Hash
+        let source = "h = {a: 1}.merge({b: 2})\nh.length()";
+        assert_eq!(execute(source).unwrap(), Value::Int(2));
+
+        let source = "{a: 1, b: 2}.keys().length()";
+        assert_eq!(execute(source).unwrap(), Value::Int(2));
     }
 
     #[test]

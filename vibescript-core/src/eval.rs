@@ -356,6 +356,7 @@ impl Engine {
             }),
         }
     }
+
     fn json_to_vibe(&self, json: serde_json::Value) -> Value {
         match json {
             serde_json::Value::Null => Value::Nil,
@@ -380,6 +381,7 @@ impl Engine {
             }
         }
     }
+
     fn vibe_to_json(&self, vibe: Value) -> serde_json::Value {
         match vibe {
             Value::Nil => serde_json::Value::Null,
@@ -393,7 +395,7 @@ impl Engine {
                 }
             }
             Value::String(s) => serde_json::Value::String(s),
-            Value::Time(t) => serde_json::Value::String(t.to_string()),
+            Value::Time(t) => serde_json::Value::String(t.to_rfc3339()),
             Value::Array(a) => {
                 serde_json::Value::Array(a.into_iter().map(|v| self.vibe_to_json(v)).collect())
             }
@@ -407,6 +409,7 @@ impl Engine {
             Value::Block { .. } => serde_json::Value::Null,
         }
     }
+
     fn eval_member_mut(
         &mut self,
         receiver: Value,
@@ -415,11 +418,19 @@ impl Engine {
         block: Option<Value>,
     ) -> Result<Value, String> {
         match (receiver, method, block) {
-            (Value::Array(arr), "length", _) => Ok(Value::Int(arr.len() as i64)),
-            (Value::String(s), "length", _) => Ok(Value::Int(s.len() as i64)),
-            (Value::Hash(h), "length", _) => Ok(Value::Int(h.len() as i64)),
+            (Value::Array(arr), "length" | "size", _) => Ok(Value::Int(arr.len() as i64)),
+            (Value::String(s), "length" | "size", _) => Ok(Value::Int(s.len() as i64)),
+            (Value::Hash(h), "length" | "size", _) => Ok(Value::Int(h.len() as i64)),
+
             (Value::String(s), "uppercase", _) => Ok(Value::String(s.to_uppercase())),
             (Value::String(s), "lowercase", _) => Ok(Value::String(s.to_lowercase())),
+            (Value::String(s), "contains?" | "include?", _) => {
+                if let Some(Value::String(pat)) = args.first() {
+                    Ok(Value::Bool(s.contains(pat)))
+                } else {
+                    Err("contains? expects a string argument".to_string())
+                }
+            }
             (Value::String(s), "split", _) => {
                 if let Some(Value::String(sep)) = args.first() {
                     let parts = s.split(sep).map(|p| Value::String(p.to_string())).collect();
@@ -428,6 +439,67 @@ impl Engine {
                     Err("split expects a string separator".to_string())
                 }
             }
+
+            (Value::Array(arr), "push", _) => {
+                let mut new_arr = arr.clone();
+                for arg in args {
+                    new_arr.push(arg);
+                }
+                Ok(Value::Array(new_arr))
+            }
+            (Value::Array(arr), "pop", _) => {
+                let mut new_arr = arr.clone();
+                new_arr.pop();
+                Ok(Value::Array(new_arr))
+            }
+            (Value::Array(arr), "include?" | "contains?", _) => {
+                if let Some(val) = args.first() {
+                    Ok(Value::Bool(arr.contains(val)))
+                } else {
+                    Err("include? expects an argument".to_string())
+                }
+            }
+            (Value::Array(arr), "join", _) => {
+                let sep = if let Some(Value::String(s)) = args.first() {
+                    s.clone()
+                } else {
+                    "".to_string()
+                };
+                let joined = arr
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(&sep);
+                Ok(Value::String(joined))
+            }
+
+            (Value::Hash(h), "keys", _) => {
+                let keys = h.keys().map(|k| Value::String(k.clone())).collect();
+                Ok(Value::Array(keys))
+            }
+            (Value::Hash(h), "values", _) => {
+                let values = h.values().cloned().collect();
+                Ok(Value::Array(values))
+            }
+            (Value::Hash(h), "has_key?" | "key?", _) => {
+                if let Some(Value::String(k)) = args.first() {
+                    Ok(Value::Bool(h.contains_key(k)))
+                } else {
+                    Err("has_key? expects a string key".to_string())
+                }
+            }
+            (Value::Hash(h), "merge", _) => {
+                if let Some(Value::Hash(other)) = args.first() {
+                    let mut new_hash = h.clone();
+                    for (k, v) in other {
+                        new_hash.insert(k.clone(), v.clone());
+                    }
+                    Ok(Value::Hash(new_hash))
+                } else {
+                    Err("merge expects a hash argument".to_string())
+                }
+            }
+
             // Collection Pipelines
             (Value::Array(arr), "each", Some(Value::Block { params, body })) => {
                 let mut last_val = Value::Nil;
@@ -455,32 +527,103 @@ impl Engine {
                 }
                 Ok(last_val)
             }
-            (Value::Array(arr), "map", Some(Value::Block { params, body })) => {
-                let mut results = Vec::new();
-                for item in arr {
+            (Value::Array(arr), "map" | "select", Some(Value::Block { params, body })) => {
+                if method == "map" {
+                    let mut results = Vec::new();
+                    for item in arr {
+                        let mut scope = HashMap::new();
+                        if let Some(param) = params.first() {
+                            scope.insert(param.clone(), item);
+                        }
+                        self.stack.push(scope);
+                        let res = self.eval_block(&body);
+                        self.stack.pop();
+                        match res? {
+                            ControlFlow::Break(v) => {
+                                results.push(v);
+                                break;
+                            }
+                            ControlFlow::Return(v) => return Ok(v),
+                            ControlFlow::Next(v) => {
+                                results.push(v);
+                            }
+                            ControlFlow::Continue(v) => {
+                                results.push(v);
+                            }
+                        }
+                    }
+                    Ok(Value::Array(results))
+                } else {
+                    // "select" (filter)
+                    let mut results = Vec::new();
+                    for item in arr {
+                        let mut scope = HashMap::new();
+                        if let Some(param) = params.first() {
+                            scope.insert(param.clone(), item.clone());
+                        }
+                        self.stack.push(scope);
+                        let res = self.eval_block(&body);
+                        self.stack.pop();
+                        match res? {
+                            ControlFlow::Break(v) => {
+                                if self.is_truthy(&v) {
+                                    results.push(item);
+                                }
+                                break;
+                            }
+                            ControlFlow::Return(v) => return Ok(v),
+                            ControlFlow::Next(v) => {
+                                if self.is_truthy(&v) {
+                                    results.push(item);
+                                }
+                            }
+                            ControlFlow::Continue(v) => {
+                                if self.is_truthy(&v) {
+                                    results.push(item);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::Array(results))
+                }
+            }
+            (Value::Array(arr), "reduce", Some(Value::Block { params, body })) => {
+                if arr.is_empty() && args.is_empty() {
+                    return Err("reduce on empty array requires initial value".to_string());
+                }
+                let mut acc = if !args.is_empty() {
+                    args[0].clone()
+                } else {
+                    arr[0].clone()
+                };
+                let start = if !args.is_empty() { 0 } else { 1 };
+
+                for i in start..arr.len() {
                     let mut scope = HashMap::new();
-                    if let Some(param) = params.first() {
-                        scope.insert(param.clone(), item);
+                    if params.len() >= 2 {
+                        scope.insert(params[0].clone(), acc);
+                        scope.insert(params[1].clone(), arr[i].clone());
                     }
                     self.stack.push(scope);
                     let res = self.eval_block(&body);
                     self.stack.pop();
                     match res? {
                         ControlFlow::Break(v) => {
-                            results.push(v);
+                            acc = v;
                             break;
                         }
                         ControlFlow::Return(v) => return Ok(v),
                         ControlFlow::Next(v) => {
-                            results.push(v);
+                            acc = v;
                         }
                         ControlFlow::Continue(v) => {
-                            results.push(v);
+                            acc = v;
                         }
                     }
                 }
-                Ok(Value::Array(results))
+                Ok(acc)
             }
+
             _ => Err(format!("Method '{}' not supported for this type", method)),
         }
     }
@@ -584,6 +727,12 @@ impl Engine {
             (Value::Float(l), BinaryOp::Div, Value::Int(r)) => Ok(Value::Float(l / r as f64)),
             (Value::Int(l), BinaryOp::Div, Value::Float(r)) => Ok(Value::Float(l as f64 / r)),
             (Value::Float(l), BinaryOp::Div, Value::Float(r)) => Ok(Value::Float(l / r)),
+
+            // String concatenation support
+            (Value::String(l), BinaryOp::Add, Value::String(r)) => {
+                Ok(Value::String(format!("{}{}", l, r)))
+            }
+
             _ => Err("Binary operation not supported".to_string()),
         }
     }

@@ -47,7 +47,7 @@ pub enum Token {
     #[token("nil")]
     Nil,
 
-    #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
+    #[regex("[a-zA-Z_][a-zA-Z0-9_]*\\??", |lex| lex.slice().to_string())]
     Ident(String),
 
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
@@ -59,7 +59,6 @@ pub enum Token {
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let s = lex.slice();
         let content = &s[1..s.len()-1];
-        // Basic unescaping for MVP
         Some(content.replace("\\\"", "\"").replace("\\n", "\n").replace("\\t", "\t"))
     })]
     String(String),
