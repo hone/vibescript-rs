@@ -2,6 +2,7 @@ use crate::ast::*;
 use crate::lexer::Token;
 use crate::value::Value;
 use chumsky::prelude::*;
+use logos::Logos;
 
 pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'a, Token>>> {
     stmt_parser()
@@ -9,6 +10,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'
         .collect::<Vec<_>>()
         .then_ignore(end())
 }
+
 fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, extra::Err<Rich<'a, Token>>> {
     recursive(|stmt| {
         let block_lit = just(Token::Do)
@@ -23,7 +25,9 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, extra::Err<Rich<'a, T
             .then(stmt.clone().repeated().collect::<Vec<_>>())
             .then_ignore(just(Token::End))
             .map(|(params, body)| Expr::Block { params, body });
+
         let expr = expr_parser(block_lit);
+
         let block = stmt.repeated().collect::<Vec<_>>();
 
         let if_stmt = just(Token::If)
@@ -46,6 +50,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, extra::Err<Rich<'a, T
                     else_branch,
                 },
             );
+
         let while_stmt = just(Token::While)
             .ignore_then(expr.clone())
             .then(block.clone())
@@ -123,6 +128,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, extra::Err<Rich<'a, T
                 rescue,
                 ensure,
             });
+
         choice((
             if_stmt,
             while_stmt,
@@ -144,14 +150,56 @@ fn expr_parser<'a>(
     block_lit: impl Parser<'a, &'a [Token], Expr, extra::Err<Rich<'a, Token>>> + Clone + 'a,
 ) -> impl Parser<'a, &'a [Token], Expr, extra::Err<Rich<'a, Token>>> + Clone {
     recursive(|expr| {
+        let string_parser = select! {
+            Token::String(s) => s,
+        }
+        .map(|s| {
+            if s.contains("#{") {
+                let mut parts = Vec::new();
+                let mut last = 0;
+                while let Some(start) = s[last..].find("#{") {
+                    let actual_start = last + start;
+                    if actual_start > last {
+                        parts.push(StringPart::Text(s[last..actual_start].to_string()));
+                    }
+
+                    if let Some(end) = s[actual_start..].find('}') {
+                        let actual_end = actual_start + end;
+                        let inner = &s[actual_start + 2..actual_end];
+
+                        let inner_tokens: Vec<_> = Token::lexer(inner)
+                            .map(|t| t.unwrap_or(Token::Nil))
+                            .collect();
+
+                        if let Ok(inner_stmts) = parser().parse(&inner_tokens).into_result() {
+                            if let Some(Stmt::Expression(inner_expr)) = inner_stmts.first() {
+                                parts.push(StringPart::Expr(inner_expr.clone()));
+                            }
+                        }
+
+                        last = actual_end + 1;
+                    } else {
+                        break;
+                    }
+                }
+                if last < s.len() {
+                    parts.push(StringPart::Text(s[last..].to_string()));
+                }
+                Expr::InterpolatedString(parts)
+            } else {
+                Expr::Literal(Value::String(s))
+            }
+        });
+
         let literal = select! {
             Token::Int(i) => Expr::Literal(Value::Int(i)),
             Token::Float(f) => Expr::Literal(Value::Float(f)),
-            Token::String(s) => Expr::Literal(Value::String(s)),
             Token::True => Expr::Literal(Value::Bool(true)),
             Token::False => Expr::Literal(Value::Bool(false)),
             Token::Nil => Expr::Literal(Value::Nil),
-        };
+        }
+        .or(string_parser);
+
         let variable = select! {
             Token::Ident(name) => Expr::Variable(name),
         };

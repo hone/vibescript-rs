@@ -17,13 +17,13 @@ pub enum Expr {
         func: String,
         args: Vec<Expr>,
         kwargs: Vec<(String, Expr)>,
-        block: Option<Box<Expr>>, // A block literal
+        block: Option<Box<Expr>>,
     },
     Member {
         receiver: Box<Expr>,
         method: String,
         args: Vec<Expr>,
-        block: Option<Box<Expr>>, // A block literal
+        block: Option<Box<Expr>>,
     },
     Array(Vec<Expr>),
     Hash(Vec<(String, Expr)>),
@@ -36,6 +36,13 @@ pub enum Expr {
         params: Vec<String>,
         body: Vec<Stmt>,
     },
+    InterpolatedString(Vec<StringPart>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringPart {
+    Text(String),
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +115,7 @@ pub enum Stmt {
         ensure: Option<Vec<Stmt>>,
     },
 }
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RescueClause {
     pub types: Vec<String>,

@@ -355,6 +355,17 @@ mod tests {
         let result = execute(source).unwrap();
         assert_eq!(result, Value::Int(10));
     }
+
+    #[test]
+    fn test_interpolation() {
+        let source = "name = \"Gwen\"\n\"Hello #{name}!\"";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::String("Hello Gwen!".to_string()));
+
+        let source = "\"Total: #{1 + 2 * 3}\"";
+        let result = execute(source).unwrap();
+        assert_eq!(result, Value::String("Total: 7".to_string()));
+    }
 }
 
 export!(MyEngine);

@@ -354,6 +354,19 @@ impl Engine {
                 params: params.clone(),
                 body: body.clone(),
             }),
+            Expr::InterpolatedString(parts) => {
+                let mut result = String::new();
+                for part in parts {
+                    match part {
+                        StringPart::Text(s) => result.push_str(s),
+                        StringPart::Expr(e) => {
+                            let val = self.eval_expr_mut(e)?;
+                            result.push_str(&val.to_string());
+                        }
+                    }
+                }
+                Ok(Value::String(result))
+            }
         }
     }
 
