@@ -6,7 +6,8 @@ pub mod lexer;
 pub mod parser;
 pub mod value;
 
-use chumsky::Parser;
+use ariadne::{Color, Label, Report, ReportKind, Source};
+use chumsky::prelude::*;
 use logos::Logos;
 
 // Generate the WASM Component bindings
@@ -45,14 +46,12 @@ impl GuestEngine for MyEngineWrapper {
         &self,
         source: String,
     ) -> Result<exports::xipkit::vibes::engine_world::Script, String> {
-        let tokens: Vec<_> = lexer::Token::lexer(&source)
-            .map(|t| t.unwrap_or(lexer::Token::Nil))
-            .collect();
+        let (tokens, spans) = lex_with_spans(&source);
 
         let stmts = parser::parser()
-            .parse(&tokens)
+            .parse(tokens.as_slice())
             .into_result()
-            .map_err(|e| format!("Parse error: {:?}", e))?;
+            .map_err(|e| format_parse_errors(&source, e, &spans))?;
 
         let script = MyScriptWrapper { stmts };
         Ok(exports::xipkit::vibes::engine_world::Script::new(script))
@@ -93,15 +92,64 @@ fn vibe_to_wit(v: value::Value) -> WitValue {
     }
 }
 
+fn lex_with_spans(source: &str) -> (Vec<lexer::Token>, Vec<SimpleSpan>) {
+    let mut tokens = Vec::new();
+    let mut spans = Vec::new();
+
+    for (token, span) in lexer::Token::lexer(source).spanned() {
+        tokens.push(token.unwrap_or(lexer::Token::Nil));
+        spans.push(span.into());
+    }
+
+    (tokens, spans)
+}
+
+fn format_parse_errors(
+    source: &str,
+    errors: Vec<Rich<lexer::Token>>,
+    spans: &[SimpleSpan],
+) -> String {
+    let mut reports = Vec::new();
+
+    for error in errors {
+        let token_span = error.span();
+        let start_byte = spans
+            .get(token_span.start)
+            .map(|s| s.start)
+            .unwrap_or(source.len());
+        let mut end_byte = spans
+            .get(token_span.end.saturating_sub(1))
+            .map(|s| s.end)
+            .unwrap_or(source.len());
+
+        if end_byte < start_byte {
+            end_byte = start_byte;
+        }
+
+        let report = Report::build(ReportKind::Error, (), start_byte)
+            .with_message(format!("{}", error.reason()))
+            .with_label(
+                Label::new(start_byte..end_byte)
+                    .with_message(format!("Error: {}", error.reason()))
+                    .with_color(Color::Red),
+            )
+            .finish();
+
+        let mut buf = Vec::new();
+        report.write(Source::from(source), &mut buf).unwrap();
+        reports.push(String::from_utf8_lossy(&buf).to_string());
+    }
+
+    reports.join("\n")
+}
+
 pub fn execute(source: &str) -> Result<value::Value, String> {
-    let tokens: Vec<_> = lexer::Token::lexer(source)
-        .map(|t| t.unwrap_or(lexer::Token::Nil))
-        .collect();
+    let (tokens, spans) = lex_with_spans(source);
 
     let stmts = parser::parser()
-        .parse(&tokens)
+        .parse(tokens.as_slice())
         .into_result()
-        .map_err(|e| format!("Parse error: {:?}", e))?;
+        .map_err(|e| format_parse_errors(source, e, &spans))?;
 
     let mut engine = eval::Engine::new();
     let mut last_val = value::Value::Nil;
@@ -485,6 +533,18 @@ mod tests {
         let res = execute(source);
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("private"));
+    }
+
+    #[test]
+    fn test_parse_errors() {
+        let source = "if true\n  x = 1\n# missing end";
+        let res = execute(source);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        println!("{}", err);
+        // Check that it looks like an Ariadne report
+        assert!(err.contains("Error"));
+        assert!(err.contains("|"));
     }
 }
 

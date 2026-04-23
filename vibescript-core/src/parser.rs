@@ -4,14 +4,16 @@ use crate::value::{EnumMember, Param, Value};
 use chumsky::prelude::*;
 use logos::Logos;
 
-pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, extra::Err<Rich<'a, Token>>> {
+pub type ParserExtra<'a> = extra::Full<Rich<'a, Token>, (), ()>;
+
+pub fn parser<'a>() -> impl Parser<'a, &'a [Token], Vec<Stmt>, ParserExtra<'a>> {
     stmt_parser()
         .repeated()
         .collect::<Vec<_>>()
         .then_ignore(end())
 }
 
-fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, extra::Err<Rich<'a, Token>>> {
+fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
     recursive(|stmt| {
         let block_body = stmt.clone().repeated().collect::<Vec<_>>();
 
@@ -48,7 +50,8 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, extra::Err<Rich<'a, T
                             let inner_tokens: Vec<_> = Token::lexer(inner)
                                 .map(|t| t.unwrap_or(Token::Nil))
                                 .collect();
-                            if let Ok(inner_stmts) = parser().parse(&inner_tokens).into_result() {
+
+                            if let Ok(inner_stmts) = parser().parse(inner_tokens.as_slice()).into_result() {
                                 if let Some(Stmt::Expression(inner_expr)) = inner_stmts.first() {
                                     parts.push(StringPart::Expr(inner_expr.clone()));
                                 }
