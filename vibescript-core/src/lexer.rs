@@ -62,7 +62,13 @@ pub enum Token {
     #[token("nil")]
     Nil,
 
-    #[regex("[a-zA-Z_][a-zA-Z0-9_]*\\??", |lex| lex.slice().to_string())]
+    #[token("..")]
+    DotDot,
+
+    #[regex(":[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[1..].to_string())]
+    Symbol(String),
+
+    #[regex("[a-zA-Z_][a-zA-Z0-9_]*[\\?!]?", |lex| lex.slice().to_string())]
     Ident(String),
 
     #[regex("@[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[1..].to_string())]
@@ -131,6 +137,8 @@ pub enum Token {
     Comma,
     #[token(":")]
     Colon,
+    #[token("::")]
+    ColonColon,
     #[token(".")]
     Dot,
     #[token("|")]
@@ -168,6 +176,8 @@ impl fmt::Display for Token {
             Token::True => write!(f, "true"),
             Token::False => write!(f, "false"),
             Token::Nil => write!(f, "nil"),
+            Token::DotDot => write!(f, ".."),
+            Token::Symbol(s) => write!(f, ":{}", s),
             Token::Ident(s) => write!(f, "{}", s),
             Token::Ivar(s) => write!(f, "@{}", s),
             Token::Cvar(s) => write!(f, "@@{}", s),
@@ -197,6 +207,7 @@ impl fmt::Display for Token {
             Token::RBrace => write!(f, "}}"),
             Token::Comma => write!(f, ","),
             Token::Colon => write!(f, ":"),
+            Token::ColonColon => write!(f, "::"),
             Token::Dot => write!(f, "."),
             Token::Pipe => write!(f, "|"),
         }

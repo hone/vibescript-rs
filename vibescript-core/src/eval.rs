@@ -7,58 +7,76 @@ use uuid::Uuid;
 
 pub struct Engine {
     globals: HashMap<String, Value>,
-    functions: HashMap<String, FunctionDef>,
-    enums: HashMap<String, EnumDef>,
-    classes: HashMap<String, Arc<ClassDef>>,
     stack: Vec<HashMap<String, Value>>,
+    pub functions: HashMap<String, FunctionDef>,
+    pub classes: HashMap<String, Arc<ClassDef>>,
+    class_vars: HashMap<String, Value>,
+    recursion_depth: usize,
 }
 
-struct EnumDef {
-    members: Vec<String>,
+const MAX_RECURSION_DEPTH: usize = 500;
+
+#[derive(Debug)]
+pub enum EvalError {
+    Message(String),
 }
 
-enum ControlFlow {
+impl From<String> for EvalError {
+    fn from(msg: String) -> Self {
+        EvalError::Message(msg)
+    }
+}
+
+#[derive(Debug)]
+pub enum ControlFlow {
     Continue(Value),
+    Return(Value),
     Break(Value),
     Next(Value),
-    Return(Value),
+}
+
+impl ControlFlow {
+    pub fn value(&self) -> Value {
+        match self {
+            ControlFlow::Continue(v) => v.clone(),
+            ControlFlow::Return(v) => v.clone(),
+            ControlFlow::Break(v) => v.clone(),
+            ControlFlow::Next(v) => v.clone(),
+        }
+    }
+
+    pub fn is_continue(&self) -> bool {
+        matches!(self, ControlFlow::Continue(_))
+    }
 }
 
 impl Engine {
     pub fn new() -> Self {
         Self {
             globals: HashMap::new(),
+            stack: vec![HashMap::new()],
             functions: HashMap::new(),
-            enums: HashMap::new(),
             classes: HashMap::new(),
-            stack: vec![HashMap::new()], // Root scope
+            class_vars: HashMap::new(),
+            recursion_depth: 0,
         }
     }
 
-    pub fn eval_stmt(&mut self, stmt: &Stmt) -> Result<Value, String> {
-        match self.eval_stmt_internal(stmt)? {
-            ControlFlow::Continue(v) => Ok(v),
-            ControlFlow::Break(v) => Ok(v),
-            ControlFlow::Next(v) => Ok(v),
-            ControlFlow::Return(v) => Ok(v),
-        }
-    }
-
-    fn eval_stmt_internal(&mut self, stmt: &Stmt) -> Result<ControlFlow, String> {
+    pub fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ControlFlow, EvalError> {
         match stmt {
-            Stmt::Expression(expr) => Ok(ControlFlow::Continue(self.eval_expr_mut(expr)?)),
+            Stmt::Expression(expr) => self.eval_expr(expr).map(ControlFlow::Continue),
             Stmt::Assignment { name, value } => {
-                let val = self.eval_expr_mut(value)?;
+                let val = self.eval_expr(value)?;
                 self.set_var(name, val.clone());
                 Ok(ControlFlow::Continue(val))
             }
             Stmt::IvarAssignment { name, value } => {
-                let val = self.eval_expr_mut(value)?;
+                let val = self.eval_expr(value)?;
                 self.set_ivar(name, val.clone())?;
                 Ok(ControlFlow::Continue(val))
             }
             Stmt::CvarAssignment { name, value } => {
-                let val = self.eval_expr_mut(value)?;
+                let val = self.eval_expr(value)?;
                 self.set_cvar(name, val.clone())?;
                 Ok(ControlFlow::Continue(val))
             }
@@ -68,18 +86,18 @@ impl Engine {
                 elsif_branches,
                 else_branch,
             } => {
-                let cond_val = self.eval_expr_mut(condition)?;
-                if self.is_truthy(&cond_val) {
+                let cond = self.eval_expr(condition)?;
+                if self.is_truthy(&cond) {
                     self.eval_block(then_branch)
                 } else {
                     for (elsif_cond, elsif_body) in elsif_branches {
-                        let elsif_val = self.eval_expr_mut(elsif_cond)?;
-                        if self.is_truthy(&elsif_val) {
+                        let cond = self.eval_expr(elsif_cond)?;
+                        if self.is_truthy(&cond) {
                             return self.eval_block(elsif_body);
                         }
                     }
-                    if let Some(else_b) = else_branch {
-                        self.eval_block(else_b)
+                    if let Some(else_body) = else_branch {
+                        self.eval_block(else_body)
                     } else {
                         Ok(ControlFlow::Continue(Value::Nil))
                     }
@@ -88,22 +106,14 @@ impl Engine {
             Stmt::While { condition, body } => {
                 let mut last_val = Value::Nil;
                 loop {
-                    let cond_val = self.eval_expr_mut(condition)?;
-                    if !self.is_truthy(&cond_val) {
+                    let cond = self.eval_expr(condition)?;
+                    if !self.is_truthy(&cond) {
                         break;
                     }
                     match self.eval_block(body)? {
+                        ControlFlow::Break(v) => return Ok(ControlFlow::Continue(v)),
                         ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
-                        ControlFlow::Break(v) => {
-                            last_val = v;
-                            break;
-                        }
-                        ControlFlow::Next(v) => {
-                            last_val = v;
-                        }
-                        ControlFlow::Continue(v) => {
-                            last_val = v;
-                        }
+                        cf => last_val = cf.value(),
                     }
                 }
                 Ok(ControlFlow::Continue(last_val))
@@ -111,22 +121,14 @@ impl Engine {
             Stmt::Until { condition, body } => {
                 let mut last_val = Value::Nil;
                 loop {
-                    let cond_val = self.eval_expr_mut(condition)?;
-                    if self.is_truthy(&cond_val) {
+                    let cond = self.eval_expr(condition)?;
+                    if self.is_truthy(&cond) {
                         break;
                     }
                     match self.eval_block(body)? {
+                        ControlFlow::Break(v) => return Ok(ControlFlow::Continue(v)),
                         ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
-                        ControlFlow::Break(v) => {
-                            last_val = v;
-                            break;
-                        }
-                        ControlFlow::Next(v) => {
-                            last_val = v;
-                        }
-                        ControlFlow::Continue(v) => {
-                            last_val = v;
-                        }
+                        cf => last_val = cf.value(),
                     }
                 }
                 Ok(ControlFlow::Continue(last_val))
@@ -136,199 +138,227 @@ impl Engine {
                 iterable,
                 body,
             } => {
+                let iter_val = self.eval_expr(iterable)?;
                 let mut last_val = Value::Nil;
-                let iter_val = self.eval_expr_mut(iterable)?;
-                if let Value::Array(arr) = iter_val {
-                    for item in arr {
-                        self.set_var(var, item);
+                if let Value::Array(a) = iter_val {
+                    let arr = a.read().unwrap().clone();
+                    for val in arr {
+                        self.set_var(var, val);
                         match self.eval_block(body)? {
-                            ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
                             ControlFlow::Break(v) => {
                                 last_val = v;
                                 break;
                             }
-                            ControlFlow::Next(v) => {
-                                last_val = v;
-                            }
-                            ControlFlow::Continue(v) => {
-                                last_val = v;
-                            }
+                            ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
+                            cf => last_val = cf.value(),
                         }
                     }
                 }
                 Ok(ControlFlow::Continue(last_val))
             }
-            Stmt::Break => Ok(ControlFlow::Break(Value::Nil)),
-            Stmt::Next => Ok(ControlFlow::Next(Value::Nil)),
             Stmt::Function(f) => {
-                self.functions.insert(
-                    f.name.clone(),
-                    FunctionDef {
-                        params: f.params.clone(),
-                        body: f.body.clone(),
-                        is_private: f.is_private,
-                    },
-                );
+                let def = FunctionDef {
+                    params: f.params.clone(),
+                    body: f.body.clone(),
+                    is_private: f.is_private,
+                };
+                if f.is_class_method {
+                    if let Some(Value::Class(c)) = self.get_var("self") {
+                        c.class_methods.write().unwrap().insert(f.name.clone(), def);
+                    }
+                } else {
+                    if let Some(Value::Class(c)) = self.get_var("self") {
+                        c.methods.write().unwrap().insert(f.name.clone(), def);
+                    } else {
+                        self.functions.insert(f.name.clone(), def);
+                    }
+                }
                 Ok(ControlFlow::Continue(Value::Nil))
             }
             Stmt::EnumDef { name, members } => {
-                self.enums.insert(
-                    name.clone(),
-                    EnumDef {
-                        members: members.iter().map(|m| m.name.clone()).collect(),
-                    },
-                );
+                let mut variants = HashMap::new();
+                for m in members {
+                    variants.insert(
+                        m.name.clone(),
+                        Value::EnumVariant {
+                            enum_name: name.clone(),
+                            variant_name: m.name.clone(),
+                        },
+                    );
+                }
+                let enum_hash = Value::new_hash(variants);
+                self.set_var(name, enum_hash);
                 Ok(ControlFlow::Continue(Value::Nil))
             }
             Stmt::ClassDef { name, body } => {
-                self.eval_class_def(name, body)?;
+                let class_def = Arc::new(ClassDef {
+                    name: name.clone(),
+                    methods: RwLock::new(HashMap::new()),
+                    class_methods: RwLock::new(HashMap::new()),
+                    class_vars: RwLock::new(HashMap::new()),
+                });
+                self.classes.insert(name.clone(), class_def.clone());
+                self.set_var(name, Value::Class(class_def.clone()));
+
+                self.stack.push(HashMap::new());
+                self.set_var("self", Value::Class(class_def.clone()));
+                for stmt in body {
+                    let cf = self.eval_stmt(stmt)?;
+                    if !cf.is_continue() {
+                        // Normally break/return not allowed in class body, but we'll follow CF
+                        self.stack.pop();
+                        return Ok(cf);
+                    }
+                }
+                self.stack.pop();
+
                 Ok(ControlFlow::Continue(Value::Nil))
             }
-            Stmt::PropertyDecl { .. } => {
-                Err("PropertyDecl only supported inside class definition".to_string())
+            Stmt::PropertyDecl { names, .. } => {
+                if let Some(Value::Class(c)) = self.get_var("self") {
+                    for name in names {
+                        let getter_body = vec![Stmt::Return(Some(Expr::InstanceVar(name.clone())))];
+                        c.methods.write().unwrap().insert(
+                            name.clone(),
+                            FunctionDef {
+                                params: vec![],
+                                body: getter_body,
+                                is_private: false,
+                            },
+                        );
+                        let setter_name = format!("{}=", name);
+                        let setter_body = vec![Stmt::IvarAssignment {
+                            name: name.clone(),
+                            value: Expr::Variable("val".to_string()),
+                        }];
+                        c.methods.write().unwrap().insert(
+                            setter_name,
+                            FunctionDef {
+                                params: vec![Param {
+                                    name: "val".to_string(),
+                                    is_ivar: false,
+                                }],
+                                body: setter_body,
+                                is_private: false,
+                            },
+                        );
+                    }
+                }
+                Ok(ControlFlow::Continue(Value::Nil))
             }
             Stmt::Return(expr) => {
                 let val = if let Some(e) = expr {
-                    self.eval_expr_mut(e)?
+                    self.eval_expr(e)?
                 } else {
                     Value::Nil
                 };
                 Ok(ControlFlow::Return(val))
             }
+            Stmt::Break => Ok(ControlFlow::Break(Value::Nil)),
+            Stmt::Next => Ok(ControlFlow::Next(Value::Nil)),
             Stmt::Try {
                 body,
                 rescue,
                 ensure,
             } => {
-                let result = self.eval_block(body);
-                let final_res = match result {
+                let res = self.eval_block(body);
+                let final_res = match res {
                     Ok(cf) => Ok(cf),
-                    Err(e) => {
-                        if let Some(rescue_clause) = rescue {
-                            self.eval_block(&rescue_clause.body)
+                    Err(EvalError::Message(_)) => {
+                        if let Some(r) = rescue {
+                            self.eval_block(&r.body)
                         } else {
-                            Err(e)
+                            res
                         }
                     }
                 };
-
-                if let Some(ensure_body) = ensure {
-                    self.eval_block(ensure_body)?;
+                if let Some(e) = ensure {
+                    let _ = self.eval_block(e);
                 }
                 final_res
             }
         }
     }
 
-    fn eval_block(&mut self, stmts: &[Stmt]) -> Result<ControlFlow, String> {
-        let mut last_val = Value::Nil;
-        for stmt in stmts {
-            match self.eval_stmt_internal(stmt)? {
-                ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
-                ControlFlow::Break(v) => return Ok(ControlFlow::Break(v)),
-                ControlFlow::Next(v) => return Ok(ControlFlow::Next(v)),
-                ControlFlow::Continue(v) => last_val = v,
-            }
-        }
-        Ok(ControlFlow::Continue(last_val))
-    }
-
-    fn set_var(&mut self, name: &str, val: Value) {
-        if let Some(scope) = self.stack.last_mut() {
-            scope.insert(name.to_string(), val);
-        }
-    }
-
-    fn get_var(&self, name: &str) -> Option<Value> {
-        for scope in self.stack.iter().rev() {
-            if let Some(val) = scope.get(name) {
-                return Some(val.clone());
-            }
-        }
-        self.globals.get(name).cloned()
-    }
-
-    fn set_ivar(&mut self, name: &str, val: Value) -> Result<(), String> {
-        let self_val = self.get_var("self").ok_or("No 'self' in current scope")?;
-        if let Value::Instance(inst) = self_val {
-            inst.write().unwrap().ivars.insert(name.to_string(), val);
-            Ok(())
-        } else {
-            Err("'self' is not an instance".to_string())
-        }
-    }
-
-    fn get_ivar(&self, name: &str) -> Result<Value, String> {
-        let self_val = self.get_var("self").ok_or("No 'self' in current scope")?;
-        if let Value::Instance(inst) = self_val {
-            Ok(inst
-                .read()
-                .unwrap()
-                .ivars
-                .get(name)
-                .cloned()
-                .unwrap_or(Value::Nil))
-        } else {
-            Err("'self' is not an instance".to_string())
-        }
-    }
-
-    fn set_cvar(&mut self, _name: &str, _val: Value) -> Result<(), String> {
-        Err("Class variables not fully implemented in MVP".to_string())
-    }
-
-    fn get_cvar(&self, _name: &str) -> Result<Value, String> {
-        Err("Class variables not fully implemented in MVP".to_string())
-    }
-
-    fn is_truthy(&self, val: &Value) -> bool {
-        match val {
-            Value::Nil => false,
-            Value::Bool(b) => *b,
-            _ => true,
-        }
-    }
-
-    pub fn eval_expr_mut(&mut self, expr: &Expr) -> Result<Value, String> {
+    pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, EvalError> {
         match expr {
             Expr::Literal(val) => Ok(val.clone()),
-            Expr::Variable(name) => {
-                if let Some(val) = self.get_var(name) {
-                    return Ok(val);
-                }
-                if let Some(c) = self.classes.get(name) {
-                    return Ok(Value::Class(c.clone()));
-                }
-                if self.enums.contains_key(name) {
-                    return Ok(Value::String(format!("ENUM:{}", name)));
-                }
-                Err(format!("Variable '{}' not found", name))
-            }
-            Expr::InstanceVar(name) => self.get_ivar(name),
-            Expr::ClassVar(name) => self.get_cvar(name),
-            Expr::Unary { op, expr } => {
-                let val = self.eval_expr_mut(expr)?;
-                self.eval_unary(*op, &val)
-            }
+            Expr::Variable(name) => self
+                .get_var(name)
+                .ok_or_else(|| EvalError::Message(format!("Variable '{}' not found", name))),
+            Expr::InstanceVar(name) => self.get_ivar(name).map_err(EvalError::Message),
+            Expr::ClassVar(name) => self.get_cvar(name).map_err(EvalError::Message),
             Expr::Binary { left, op, right } => {
+                let lhs = self.eval_expr(left)?;
                 if *op == BinaryOp::And {
-                    let lhs = self.eval_expr_mut(left)?;
-                    if !self.is_truthy(&lhs) {
-                        return Ok(lhs);
-                    }
-                    return self.eval_expr_mut(right);
+                    return if self.is_truthy(&lhs) {
+                        self.eval_expr(right)
+                    } else {
+                        Ok(lhs)
+                    };
                 }
                 if *op == BinaryOp::Or {
-                    let lhs = self.eval_expr_mut(left)?;
-                    if self.is_truthy(&lhs) {
-                        return Ok(lhs);
-                    }
-                    return self.eval_expr_mut(right);
+                    return if self.is_truthy(&lhs) {
+                        Ok(lhs)
+                    } else {
+                        self.eval_expr(right)
+                    };
+                }
+                let rhs = self.eval_expr(right)?;
+                self.eval_binary(lhs, *op, rhs).map_err(EvalError::Message)
+            }
+            Expr::Unary { op, expr } => {
+                let val = self.eval_expr(expr)?;
+                self.eval_unary(*op, &val).map_err(EvalError::Message)
+            }
+            Expr::Call {
+                func,
+                args,
+                kwargs: _,
+                block,
+            } => {
+                let mut arg_vals = Vec::new();
+                for arg in args {
+                    arg_vals.push(self.eval_expr(arg)?);
                 }
 
-                let lhs = self.eval_expr_mut(left)?;
-                let rhs = self.eval_expr_mut(right)?;
-                self.eval_binary(lhs, *op, rhs)
+                match func.as_str() {
+                    "money" => {
+                        if let Some(Value::String(s)) = arg_vals.first() {
+                            return Ok(Value::String(format!("{} (money)", s)));
+                        }
+                    }
+                    "json_parse" => {
+                        if let Some(Value::String(s)) = arg_vals.first() {
+                            let v: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+                                EvalError::Message(format!("JSON parse error: {}", e))
+                            })?;
+                            return Ok(self.json_to_vibe(v));
+                        }
+                    }
+                    "uuid" => return Ok(Value::String(Uuid::new_v4().to_string())),
+                    "now" => return Ok(Value::Time(Utc::now())),
+                    _ => {}
+                }
+
+                if let Some(f) = self.functions.get(func).cloned() {
+                    return self.call_function_def(&f, arg_vals, block.as_deref());
+                }
+
+                if let Some(Value::Instance(inst)) = self.get_var("self") {
+                    let class = inst.read().unwrap().class.clone();
+                    if let Some(f) = class.methods.read().unwrap().get(func).cloned() {
+                        return self.call_function_def(&f, arg_vals, block.as_deref());
+                    }
+                }
+
+                if let Some(class) = self.classes.get(func).cloned() {
+                    if let Some(f) = class.class_methods.read().unwrap().get(func).cloned() {
+                        return self.call_function_def(&f, arg_vals, block.as_deref());
+                    }
+                }
+
+                Err(EvalError::Message(format!("Function '{}' not found", func)))
             }
             Expr::Member {
                 receiver,
@@ -336,122 +366,43 @@ impl Engine {
                 args,
                 block,
             } => {
-                let rec_val = self.eval_expr_mut(receiver)?;
-
-                if let Value::String(s) = &rec_val {
-                    if let Some(enum_name) = s.strip_prefix("ENUM:") {
-                        if let Some(enum_def) = self.enums.get(enum_name) {
-                            if enum_def.members.contains(&method.to_string()) {
-                                return Ok(Value::EnumVariant {
-                                    enum_name: enum_name.to_string(),
-                                    variant_name: method.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-
+                let recv_val = self.eval_expr(receiver)?;
                 let mut arg_vals = Vec::new();
                 for arg in args {
-                    arg_vals.push(self.eval_expr_mut(arg)?);
+                    arg_vals.push(self.eval_expr(arg)?);
                 }
-                let block_val = if let Some(b) = block {
-                    Some(self.eval_expr_mut(b)?)
-                } else {
-                    None
-                };
-                self.eval_member_mut(rec_val, method, arg_vals, block_val)
-            }
-            Expr::Call { func, args, .. } => {
-                let mut arg_vals = Vec::new();
-                for arg in args {
-                    arg_vals.push(self.eval_expr_mut(arg)?);
-                }
-                match func.as_str() {
-                    "print" => {
-                        for arg in &arg_vals {
-                            print!("{} ", arg.to_string());
-                        }
-                        println!();
-                        Ok(Value::Nil)
-                    }
-                    "now" => Ok(Value::Time(Utc::now())),
-                    "uuid" => Ok(Value::String(Uuid::new_v4().to_string())),
-                    "json_parse" => {
-                        if let Some(Value::String(s)) = arg_vals.first() {
-                            let json_val: serde_json::Value =
-                                serde_json::from_str(s).map_err(|e| e.to_string())?;
-                            Ok(self.json_to_vibe(json_val))
-                        } else {
-                            Err("json_parse expects a string argument".to_string())
-                        }
-                    }
-                    "json_stringify" => {
-                        if let Some(val) = arg_vals.first() {
-                            let json_val = self.vibe_to_json(val.clone());
-                            let s = serde_json::to_string(&json_val).map_err(|e| e.to_string())?;
-                            Ok(Value::String(s))
-                        } else {
-                            Err("json_stringify expects an argument".to_string())
-                        }
-                    }
-                    _ => {
-                        // Method Resolution Logic for local calls
-                        let current_self = self.get_var("self");
-                        if let Some(Value::Instance(inst)) = current_self {
-                            let class_def = inst.read().unwrap().class.clone();
-                            if let Some(fn_def) = class_def.methods.get(func) {
-                                // Calling a local method within 'self' context
-                                self.stack.push(HashMap::from([(
-                                    "self".to_string(),
-                                    Value::Instance(inst.clone()),
-                                )]));
-                                let res = self.call_function_def(fn_def, arg_vals)?;
-                                self.stack.pop();
-                                return Ok(res);
-                            }
-                        }
-                        self.call_function(func, arg_vals)
-                    }
-                }
+                self.eval_member(recv_val, method, arg_vals, block.as_deref())
             }
             Expr::Array(elements) => {
                 let mut vals = Vec::new();
                 for e in elements {
-                    vals.push(self.eval_expr_mut(e)?);
+                    vals.push(self.eval_expr(e)?);
                 }
-                Ok(Value::Array(vals))
+                Ok(Value::new_array(vals))
             }
-            Expr::Hash(pairs) => {
+            Expr::Hash(entries) => {
                 let mut hash = HashMap::new();
-                for (key, val_expr) in pairs {
-                    hash.insert(key.clone(), self.eval_expr_mut(val_expr)?);
+                for (key, val_expr) in entries {
+                    hash.insert(key.clone(), self.eval_expr(val_expr)?);
                 }
-                Ok(Value::Hash(hash))
+                Ok(Value::new_hash(hash))
             }
             Expr::Case {
                 target,
                 clauses,
                 else_expr,
             } => {
-                let target_val = self.eval_expr_mut(target)?;
+                let t = self.eval_expr(target)?;
                 for clause in clauses {
                     for val_expr in &clause.values {
-                        let val = self.eval_expr_mut(val_expr)?;
-                        if target_val == val {
-                            return match self.eval_block(&clause.body)? {
-                                ControlFlow::Continue(v) => Ok(v),
-                                ControlFlow::Return(v) => Ok(v),
-                                _ => Err("Control flow in case result not supported".to_string()),
-                            };
+                        let val = self.eval_expr(val_expr)?;
+                        if val == t {
+                            return self.eval_block(&clause.body).map(|cf| cf.value());
                         }
                     }
                 }
-                if let Some(else_b) = else_expr {
-                    match self.eval_block(else_b)? {
-                        ControlFlow::Continue(v) => Ok(v),
-                        _ => Err("Control flow in case else result not supported".to_string()),
-                    }
+                if let Some(e) = else_expr {
+                    self.eval_block(e).map(|cf| cf.value())
                 } else {
                     Ok(Value::Nil)
                 }
@@ -466,7 +417,7 @@ impl Engine {
                     match part {
                         StringPart::Text(s) => result.push_str(s),
                         StringPart::Expr(e) => {
-                            let val = self.eval_expr_mut(e)?;
+                            let val = self.eval_expr(e)?;
                             result.push_str(&val.to_string());
                         }
                     }
@@ -476,7 +427,77 @@ impl Engine {
         }
     }
 
-    fn json_to_vibe(&self, json: serde_json::Value) -> Value {
+    fn eval_block(&mut self, stmts: &[Stmt]) -> Result<ControlFlow, EvalError> {
+        let mut last_val = Value::Nil;
+        for stmt in stmts {
+            let cf = self.eval_stmt(stmt)?;
+            if !cf.is_continue() {
+                return Ok(cf);
+            }
+            last_val = cf.value();
+        }
+        Ok(ControlFlow::Continue(last_val))
+    }
+
+    fn get_var(&self, name: &str) -> Option<Value> {
+        for scope in self.stack.iter().rev() {
+            if let Some(val) = scope.get(name) {
+                return Some(val.clone());
+            }
+        }
+        self.globals.get(name).cloned()
+    }
+
+    fn set_var(&mut self, name: &str, val: Value) {
+        if let Some(scope) = self.stack.last_mut() {
+            scope.insert(name.to_string(), val);
+        } else {
+            self.globals.insert(name.to_string(), val);
+        }
+    }
+
+    fn get_ivar(&self, name: &str) -> Result<Value, String> {
+        if let Some(Value::Instance(inst)) = self.get_var("self") {
+            Ok(inst
+                .read()
+                .unwrap()
+                .ivars
+                .get(name)
+                .cloned()
+                .unwrap_or(Value::Nil))
+        } else {
+            Err(format!(
+                "Cannot access instance variable '{}' outside instance",
+                name
+            ))
+        }
+    }
+
+    fn set_ivar(&mut self, name: &str, val: Value) -> Result<(), EvalError> {
+        if let Some(Value::Instance(inst)) = self.get_var("self") {
+            inst.write().unwrap().ivars.insert(name.to_string(), val);
+            Ok(())
+        } else {
+            Err(EvalError::Message(format!(
+                "Cannot set instance variable '{}' outside instance",
+                name
+            )))
+        }
+    }
+
+    fn get_cvar(&self, name: &str) -> Result<Value, String> {
+        self.class_vars
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("Class variable '{}' not found", name))
+    }
+
+    fn set_cvar(&mut self, name: &str, val: Value) -> Result<(), EvalError> {
+        self.class_vars.insert(name.to_string(), val);
+        Ok(())
+    }
+
+    pub fn json_to_vibe(&self, json: serde_json::Value) -> Value {
         match json {
             serde_json::Value::Null => Value::Nil,
             serde_json::Value::Bool(b) => Value::Bool(b),
@@ -489,19 +510,19 @@ impl Engine {
             }
             serde_json::Value::String(s) => Value::String(s),
             serde_json::Value::Array(a) => {
-                Value::Array(a.into_iter().map(|v| self.json_to_vibe(v)).collect())
+                Value::new_array(a.into_iter().map(|v| self.json_to_vibe(v)).collect())
             }
-            serde_json::Value::Object(o) => {
+            serde_json::Value::Object(m) => {
                 let mut hash = HashMap::new();
-                for (k, v) in o {
+                for (k, v) in m {
                     hash.insert(k, self.json_to_vibe(v));
                 }
-                Value::Hash(hash)
+                Value::new_hash(hash)
             }
         }
     }
 
-    fn vibe_to_json(&self, vibe: Value) -> serde_json::Value {
+    pub fn vibe_to_json(&self, vibe: Value) -> serde_json::Value {
         match vibe {
             Value::Nil => serde_json::Value::Null,
             Value::Bool(b) => serde_json::Value::Bool(b),
@@ -514,203 +535,181 @@ impl Engine {
                 }
             }
             Value::String(s) => serde_json::Value::String(s),
+            Value::Symbol(s) => serde_json::Value::String(format!(":{}", s)),
             Value::Time(t) => serde_json::Value::String(t.to_rfc3339()),
             Value::EnumVariant {
                 enum_name,
                 variant_name,
             } => serde_json::Value::String(format!("{}.{}", enum_name, variant_name)),
             Value::Array(a) => {
-                serde_json::Value::Array(a.into_iter().map(|v| self.vibe_to_json(v)).collect())
+                let arr = a.read().unwrap();
+                serde_json::Value::Array(arr.iter().map(|v| self.vibe_to_json(v.clone())).collect())
             }
             Value::Hash(h) => {
+                let hash = h.read().unwrap();
                 let mut map = serde_json::Map::new();
-                for (k, v) in h {
-                    map.insert(k, self.vibe_to_json(v));
+                for (k, v) in hash.iter() {
+                    map.insert(k.clone(), self.vibe_to_json(v.clone()));
                 }
                 serde_json::Value::Object(map)
             }
-            Value::Block { .. } => serde_json::Value::Null,
-            Value::Class(c) => serde_json::Value::String(format!("<class {}>", c.name)),
-            Value::Instance(i) => {
-                serde_json::Value::String(format!("<instance of {}>", i.read().unwrap().class.name))
-            }
+            _ => serde_json::Value::Null,
         }
     }
 
-    fn eval_class_def(&mut self, name: &str, body: &[Stmt]) -> Result<(), String> {
-        let mut class_methods = HashMap::new();
-        let mut methods = HashMap::new();
-
-        for stmt in body {
-            match stmt {
-                Stmt::Function(f) => {
-                    let def = FunctionDef {
-                        params: f.params.clone(),
-                        body: f.body.clone(),
-                        is_private: f.is_private,
-                    };
-                    if f.is_class_method {
-                        class_methods.insert(f.name.clone(), def);
-                    } else {
-                        methods.insert(f.name.clone(), def);
-                    }
-                }
-                Stmt::PropertyDecl { names, kind } => {
-                    for prop_name in names {
-                        match kind {
-                            PropertyKind::Property => {
-                                methods.insert(prop_name.clone(), self.make_getter(prop_name));
-                                methods
-                                    .insert(format!("{}=", prop_name), self.make_setter(prop_name));
-                            }
-                            PropertyKind::Getter => {
-                                methods.insert(prop_name.clone(), self.make_getter(prop_name));
-                            }
-                            PropertyKind::Setter => {
-                                methods
-                                    .insert(format!("{}=", prop_name), self.make_setter(prop_name));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let class_def = Arc::new(ClassDef {
-            name: name.to_string(),
-            methods,
-            class_methods,
-            class_vars: RwLock::new(HashMap::new()),
-        });
-
-        self.classes.insert(name.to_string(), class_def);
-        Ok(())
-    }
-
-    fn make_getter(&self, name: &str) -> FunctionDef {
-        FunctionDef {
-            params: vec![],
-            body: vec![Stmt::Expression(Expr::InstanceVar(name.to_string()))],
-            is_private: false,
+    fn is_truthy(&self, val: &Value) -> bool {
+        match val {
+            Value::Nil => false,
+            Value::Bool(b) => *b,
+            _ => true,
         }
     }
 
-    fn make_setter(&self, name: &str) -> FunctionDef {
-        FunctionDef {
-            params: vec![Param {
-                name: "val".to_string(),
-                is_ivar: false,
-            }],
-            body: vec![Stmt::IvarAssignment {
-                name: name.to_string(),
-                value: Expr::Variable("val".to_string()),
-            }],
-            is_private: false,
-        }
-    }
-
-    fn eval_member_mut(
+    fn eval_member(
         &mut self,
         receiver: Value,
         method: &str,
         args: Vec<Value>,
-        block: Option<Value>,
-    ) -> Result<Value, String> {
+        block: Option<&Expr>,
+    ) -> Result<Value, EvalError> {
+        // High priority: Standard methods
         match (receiver.clone(), method, block) {
-            (Value::Class(c), "new", _) => {
-                let instance = Arc::new(RwLock::new(InstanceData {
-                    class: c.clone(),
-                    ivars: HashMap::new(),
-                }));
-                let inst_val = Value::Instance(instance);
-
-                if let Some(init_fn) = c.methods.get("initialize") {
-                    self.stack
-                        .push(HashMap::from([("self".to_string(), inst_val.clone())]));
-                    self.call_function_def(init_fn, args)?;
-                    self.stack.pop();
-                }
-                Ok(inst_val)
+            (Value::Array(a), "length" | "size", _) => {
+                return Ok(Value::Int(a.read().unwrap().len() as i64));
             }
-            (Value::Instance(inst), method_name, _) => {
-                let class_def = inst.read().unwrap().class.clone();
-                if let Some(fn_def) = class_def.methods.get(method_name) {
-                    if fn_def.is_private {
-                        let current_self = self.get_var("self");
-                        let is_internal = if let Some(Value::Instance(curr)) = current_self {
-                            Arc::ptr_eq(&curr, &inst)
+            (Value::String(s), "length" | "size", _) => return Ok(Value::Int(s.len() as i64)),
+            (Value::Hash(h), "length" | "size", _) => {
+                return Ok(Value::Int(h.read().unwrap().len() as i64));
+            }
+            (Value::Hash(h), "keys", _) => {
+                let hash = h.read().unwrap();
+                let keys = hash.keys().map(|k| Value::String(k.clone())).collect();
+                return Ok(Value::new_array(keys));
+            }
+            (Value::Hash(h), "values", _) => {
+                let hash = h.read().unwrap();
+                let values = hash.values().cloned().collect();
+                return Ok(Value::new_array(values));
+            }
+            (Value::Hash(h), "merge", _) => {
+                if let Some(Value::Hash(other_h)) = args.first() {
+                    let hash = h.read().unwrap();
+                    let other_hash = other_h.read().unwrap();
+                    let mut new_hash = hash.clone();
+                    new_hash.extend(other_hash.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    return Ok(Value::new_hash(new_hash));
+                }
+            }
+            _ => {}
+        }
+
+        match (receiver.clone(), method, block) {
+            (Value::Instance(inst), method, _) => {
+                let class = inst.read().unwrap().class.clone();
+                if let Some(f) = class.methods.read().unwrap().get(method).cloned() {
+                    if f.is_private {
+                        if let Some(Value::Instance(curr_self)) = self.get_var("self") {
+                            if !Arc::ptr_eq(&curr_self, &inst) {
+                                return Err(EvalError::Message(format!(
+                                    "Method '{}' is private",
+                                    method
+                                )));
+                            }
                         } else {
-                            false
-                        };
-                        if !is_internal {
-                            return Err(format!("Method '{}' is private", method_name));
+                            return Err(EvalError::Message(format!(
+                                "Method '{}' is private",
+                                method
+                            )));
                         }
                     }
-
-                    self.stack.push(HashMap::from([(
-                        "self".to_string(),
-                        Value::Instance(inst.clone()),
-                    )]));
-                    let res = self.call_function_def(fn_def, args)?;
+                    self.stack.push(HashMap::new());
+                    self.set_var("self", Value::Instance(inst.clone()));
+                    let cf = self.call_function_def_cf(&f, args, block);
                     self.stack.pop();
-                    Ok(res)
+                    cf.map(|c| c.value())
                 } else {
-                    Err(format!(
-                        "Method '{}' not found in class {}",
-                        method_name, class_def.name
-                    ))
+                    Err(EvalError::Message(format!(
+                        "Method '{}' not found for class '{}'",
+                        method, class.name
+                    )))
                 }
             }
-            (Value::Array(arr), "length" | "size", _) => Ok(Value::Int(arr.len() as i64)),
-            (Value::String(s), "length" | "size", _) => Ok(Value::Int(s.len() as i64)),
-            (Value::Hash(h), "length" | "size", _) => Ok(Value::Int(h.len() as i64)),
+
+            (Value::Class(class), "new", _) => {
+                let inst = Arc::new(RwLock::new(InstanceData {
+                    class: class.clone(),
+                    ivars: HashMap::new(),
+                }));
+                if let Some(f) = class.methods.read().unwrap().get("initialize").cloned() {
+                    self.stack.push(HashMap::new());
+                    self.set_var("self", Value::Instance(inst.clone()));
+                    let _ = self.call_function_def_cf(&f, args, None)?;
+                    self.stack.pop();
+                }
+                Ok(Value::Instance(inst))
+            }
+
+            (Value::Hash(h), method, _) => {
+                let hash = h.read().unwrap();
+                if let Some(val) = hash.get(method).cloned() {
+                    Ok(val)
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Method '{}' not found for Hash",
+                        method
+                    )))
+                }
+            }
+
+            (Value::EnumVariant { variant_name, .. }, "name", _) => {
+                Ok(Value::String(variant_name.clone()))
+            }
+            (Value::EnumVariant { variant_name, .. }, "symbol", _) => {
+                Ok(Value::Symbol(variant_name.to_lowercase()))
+            }
 
             (_, "to_string", _) => Ok(Value::String(receiver.to_string())),
 
             (Value::String(s), "uppercase", _) => Ok(Value::String(s.to_uppercase())),
             (Value::String(s), "lowercase", _) => Ok(Value::String(s.to_lowercase())),
             (Value::String(s), "contains?" | "include?", _) => {
-                if let Some(Value::String(pat)) = args.first() {
-                    Ok(Value::Bool(s.contains(pat)))
+                if let Some(Value::String(sub)) = args.first() {
+                    Ok(Value::Bool(s.contains(sub)))
                 } else {
-                    Err("contains? expects a string argument".to_string())
+                    Ok(Value::Bool(false))
                 }
             }
-            (Value::String(s), "split", _) => {
-                if let Some(Value::String(sep)) = args.first() {
-                    let parts = s.split(sep).map(|p| Value::String(p.to_string())).collect();
-                    Ok(Value::Array(parts))
-                } else {
-                    Err("split expects a string separator".to_string())
-                }
-            }
+            (Value::String(s), "strip", _) => Ok(Value::String(s.trim().to_string())),
 
-            (Value::Array(arr), "push", _) => {
-                let mut new_arr = arr.clone();
+            (Value::Array(a), "push", _) => {
+                let mut arr = a.write().unwrap();
                 for arg in args {
-                    new_arr.push(arg);
+                    arr.push(arg);
                 }
-                Ok(Value::Array(new_arr))
+                drop(arr);
+                Ok(Value::Array(a.clone()))
             }
-            (Value::Array(arr), "pop", _) => {
-                let mut new_arr = arr.clone();
-                new_arr.pop();
-                Ok(Value::Array(new_arr))
+            (Value::Array(a), "pop", _) => {
+                let mut arr = a.write().unwrap();
+                let val = arr.pop().unwrap_or(Value::Nil);
+                drop(arr);
+                Ok(val)
             }
-            (Value::Array(arr), "include?" | "contains?", _) => {
-                if let Some(val) = args.first() {
-                    Ok(Value::Bool(arr.contains(val)))
+            (Value::Array(a), "include?" | "contains?", _) => {
+                if let Some(target) = args.first() {
+                    let arr = a.read().unwrap();
+                    Ok(Value::Bool(arr.contains(target)))
                 } else {
-                    Err("include? expects an argument".to_string())
+                    Ok(Value::Bool(false))
                 }
             }
-            (Value::Array(arr), "join", _) => {
+            (Value::Array(a), "join", _) => {
                 let sep = if let Some(Value::String(s)) = args.first() {
                     s.clone()
                 } else {
                     "".to_string()
                 };
+                let arr = a.read().unwrap();
                 let joined = arr
                     .iter()
                     .map(|v| v.to_string())
@@ -718,206 +717,200 @@ impl Engine {
                     .join(&sep);
                 Ok(Value::String(joined))
             }
-
-            (Value::Hash(h), "keys", _) => {
-                let keys = h.keys().map(|k| Value::String(k.clone())).collect();
-                Ok(Value::Array(keys))
-            }
-            (Value::Hash(h), "values", _) => {
-                let values = h.values().cloned().collect();
-                Ok(Value::Array(values))
-            }
-            (Value::Hash(h), "has_key?" | "key?", _) => {
-                if let Some(Value::String(k)) = args.first() {
-                    Ok(Value::Bool(h.contains_key(k)))
-                } else {
-                    Err("has_key? expects a string key".to_string())
-                }
-            }
-            (Value::Hash(h), "merge", _) => {
-                if let Some(Value::Hash(other)) = args.first() {
-                    let mut new_hash = h.clone();
-                    for (k, v) in other {
-                        new_hash.insert(k.clone(), v.clone());
-                    }
-                    Ok(Value::Hash(new_hash))
-                } else {
-                    Err("merge expects a hash argument".to_string())
-                }
-            }
-
-            // Collection Pipelines
-            (Value::Array(arr), "each", Some(Value::Block { params, body })) => {
-                let mut last_val = Value::Nil;
-                for item in arr {
+            (Value::Array(a), "map", Some(Expr::Block { params, body })) => {
+                let arr = a.read().unwrap().clone();
+                let mut results = Vec::new();
+                for val in arr {
                     let mut scope = HashMap::new();
-                    if let Some(param) = params.first() {
-                        scope.insert(param.clone(), item);
+                    if let Some(p) = params.first() {
+                        scope.insert(p.clone(), val);
                     }
                     self.stack.push(scope);
-                    let res = self.eval_block(&body);
+                    let cf = self.eval_block(body)?;
                     self.stack.pop();
-                    match res? {
-                        ControlFlow::Break(v) => {
-                            last_val = v;
-                            break;
-                        }
-                        ControlFlow::Return(v) => return Ok(v),
-                        ControlFlow::Next(v) => {
-                            last_val = v;
-                        }
-                        ControlFlow::Continue(v) => {
-                            last_val = v;
-                        }
-                    }
+                    results.push(cf.value());
                 }
-                Ok(last_val)
+                Ok(Value::new_array(results))
             }
-            (Value::Array(arr), "map" | "select", Some(Value::Block { params, body })) => {
-                if method == "map" {
-                    let mut results = Vec::new();
-                    for item in arr {
-                        let mut scope = HashMap::new();
-                        if let Some(param) = params.first() {
-                            scope.insert(param.clone(), item);
-                        }
-                        self.stack.push(scope);
-                        let res = self.eval_block(&body);
-                        self.stack.pop();
-                        match res? {
-                            ControlFlow::Break(v) => {
-                                results.push(v);
-                                break;
-                            }
-                            ControlFlow::Return(v) => return Ok(v),
-                            ControlFlow::Next(v) => {
-                                results.push(v);
-                            }
-                            ControlFlow::Continue(v) => {
-                                results.push(v);
-                            }
-                        }
-                    }
-                    Ok(Value::Array(results))
-                } else {
-                    // "select" (filter)
-                    let mut results = Vec::new();
-                    for item in arr {
-                        let mut scope = HashMap::new();
-                        if let Some(param) = params.first() {
-                            scope.insert(param.clone(), item.clone());
-                        }
-                        self.stack.push(scope);
-                        let res = self.eval_block(&body);
-                        self.stack.pop();
-                        match res? {
-                            ControlFlow::Break(v) => {
-                                if self.is_truthy(&v) {
-                                    results.push(item);
-                                }
-                                break;
-                            }
-                            ControlFlow::Return(v) => return Ok(v),
-                            ControlFlow::Next(v) => {
-                                if self.is_truthy(&v) {
-                                    results.push(item);
-                                }
-                            }
-                            ControlFlow::Continue(v) => {
-                                if self.is_truthy(&v) {
-                                    results.push(item);
-                                }
-                            }
-                        }
-                    }
-                    Ok(Value::Array(results))
-                }
-            }
-            (Value::Array(arr), "reduce", Some(Value::Block { params, body })) => {
-                if arr.is_empty() && args.is_empty() {
-                    return Err("reduce on empty array requires initial value".to_string());
-                }
-                let mut acc = if !args.is_empty() {
-                    args[0].clone()
-                } else {
-                    arr[0].clone()
-                };
-                let start = if !args.is_empty() { 0 } else { 1 };
-
-                for i in start..arr.len() {
+            (Value::Array(a), "select", Some(Expr::Block { params, body })) => {
+                let arr = a.read().unwrap().clone();
+                let mut results = Vec::new();
+                for val in arr {
                     let mut scope = HashMap::new();
-                    if params.len() >= 2 {
-                        scope.insert(params[0].clone(), acc);
-                        scope.insert(params[1].clone(), arr[i].clone());
+                    if let Some(p) = params.first() {
+                        scope.insert(p.clone(), val.clone());
                     }
                     self.stack.push(scope);
-                    let res = self.eval_block(&body);
+                    let cf = self.eval_block(body)?;
                     self.stack.pop();
-                    match res? {
-                        ControlFlow::Break(v) => {
-                            acc = v;
-                            break;
-                        }
-                        ControlFlow::Return(v) => return Ok(v),
-                        ControlFlow::Next(v) => {
-                            acc = v;
-                        }
-                        ControlFlow::Continue(v) => {
-                            acc = v;
-                        }
+                    if self.is_truthy(&cf.value()) {
+                        results.push(val);
                     }
+                }
+                Ok(Value::new_array(results))
+            }
+            (Value::Array(a), "reduce", Some(Expr::Block { params, body })) => {
+                let mut acc = args.first().cloned().unwrap_or(Value::Nil);
+                let arr = a.read().unwrap().clone();
+                for val in arr {
+                    let mut scope = HashMap::new();
+                    if let Some(p) = params.first() {
+                        scope.insert(p.clone(), acc);
+                    }
+                    if let Some(p) = params.get(1) {
+                        scope.insert(p.clone(), val);
+                    }
+                    self.stack.push(scope);
+                    let cf = self.eval_block(body)?;
+                    self.stack.pop();
+                    acc = cf.value();
                 }
                 Ok(acc)
             }
 
-            _ => Err(format!("Method '{}' not supported for this type", method)),
+            (Value::Array(a), "[]=", _) => {
+                if args.len() < 2 {
+                    return Err(EvalError::Message(
+                        "[]= expects an index and a value".to_string(),
+                    ));
+                }
+                let idx_val = &args[0];
+                let new_val = &args[1];
+                if let Value::Int(i) = idx_val {
+                    let mut arr = a.write().unwrap();
+                    let idx = if *i < 0 { arr.len() as i64 + i } else { *i };
+                    if idx < 0 || idx >= arr.len() as i64 {
+                        return Err(EvalError::Message(format!(
+                            "Array index {} out of bounds (length {})",
+                            i,
+                            arr.len()
+                        )));
+                    }
+                    arr[idx as usize] = new_val.clone();
+                    Ok(new_val.clone())
+                } else {
+                    Err(EvalError::Message(
+                        "Array index must be an integer".to_string(),
+                    ))
+                }
+            }
+
+            (Value::Hash(h), "[]=", _) => {
+                if args.len() < 2 {
+                    return Err(EvalError::Message(
+                        "[]= expects a key and a value".to_string(),
+                    ));
+                }
+                let key_val = &args[0];
+                let new_val = &args[1];
+                if let Value::String(s) = key_val {
+                    let mut hash = h.write().unwrap();
+                    hash.insert(s.clone(), new_val.clone());
+                    Ok(new_val.clone())
+                } else {
+                    Err(EvalError::Message("Hash key must be a string".to_string()))
+                }
+            }
+
+            (Value::Array(a), "each", Some(Expr::Block { params, body })) => {
+                let arr = a.read().unwrap().clone();
+                for val in arr {
+                    let mut scope = HashMap::new();
+                    if let Some(p) = params.first() {
+                        scope.insert(p.clone(), val);
+                    }
+                    self.stack.push(scope);
+                    let cf = self.eval_block(body)?;
+                    self.stack.pop();
+                    if !cf.is_continue() {
+                        if matches!(cf, ControlFlow::Break(_)) {
+                            break;
+                        }
+                        return Ok(cf.value());
+                    }
+                }
+                Ok(Value::Array(a))
+            }
+
+            _ => Err(EvalError::Message(format!(
+                "Method '{}' not supported for this type",
+                method
+            ))),
         }
     }
 
-    fn call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    pub fn call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
         let fn_def = self
             .functions
             .get(name)
             .cloned()
             .ok_or_else(|| format!("Function '{}' not found", name))?;
 
-        if fn_def.is_private {
-            return Err(format!("Function '{}' is private", name));
-        }
-
-        self.call_function_def(&fn_def, args)
+        self.call_function_def(&fn_def, args, None)
+            .map_err(|e| match e {
+                EvalError::Message(m) => m,
+            })
     }
 
-    fn call_function_def(&mut self, func: &FunctionDef, args: Vec<Value>) -> Result<Value, String> {
-        if args.len() != func.params.len() {
-            return Err(format!(
-                "Expected {} args, got {}",
+    fn call_function_def(
+        &mut self,
+        func: &FunctionDef,
+        args: Vec<Value>,
+        _block: Option<&Expr>,
+    ) -> Result<Value, EvalError> {
+        self.call_function_def_cf(func, args, _block)
+            .map(|cf| cf.value())
+    }
+
+    fn call_function_def_cf(
+        &mut self,
+        func: &FunctionDef,
+        args: Vec<Value>,
+        _block: Option<&Expr>,
+    ) -> Result<ControlFlow, EvalError> {
+        self.recursion_depth += 1;
+        if self.recursion_depth > MAX_RECURSION_DEPTH {
+            self.recursion_depth -= 1;
+            return Err(EvalError::Message(
+                "Stack overflow: maximum recursion depth exceeded".to_string(),
+            ));
+        }
+
+        let result = self.do_call_function_def(func, args, _block);
+
+        self.recursion_depth -= 1;
+        result
+    }
+
+    fn do_call_function_def(
+        &mut self,
+        func: &FunctionDef,
+        args: Vec<Value>,
+        _block: Option<&Expr>,
+    ) -> Result<ControlFlow, EvalError> {
+        if func.params.len() != args.len() {
+            return Err(EvalError::Message(format!(
+                "Expected {} arguments, but got {}",
                 func.params.len(),
                 args.len()
-            ));
+            )));
         }
 
         let mut new_scope = HashMap::new();
         for (param, val) in func.params.iter().zip(args) {
             new_scope.insert(param.name.clone(), val.clone());
-            // If the parameter is an ivar, set it on self
             if param.is_ivar {
-                self.stack.push(new_scope.clone()); // Temporary push to have 'self' if it exists
+                self.stack.push(new_scope.clone());
                 self.set_ivar(&param.name, val.clone())?;
                 new_scope = self.stack.pop().unwrap();
             }
         }
 
         self.stack.push(new_scope);
-        let result = self.eval_block(&func.body);
+        let cf = self.eval_block(&func.body)?;
         self.stack.pop();
 
-        match result? {
-            ControlFlow::Return(v) => Ok(v),
-            ControlFlow::Break(v) => Ok(v),
-            ControlFlow::Next(v) => Ok(v),
-            ControlFlow::Continue(v) => Ok(v),
-        }
+        Ok(ControlFlow::Continue(cf.value()))
     }
 
     fn eval_unary(&self, op: UnaryOp, val: &Value) -> Result<Value, String> {
@@ -931,7 +924,8 @@ impl Engine {
 
     fn eval_binary(&self, lhs: Value, op: BinaryOp, rhs: Value) -> Result<Value, String> {
         match (lhs, op, rhs) {
-            (Value::Array(arr), BinaryOp::Index, Value::Int(i)) => {
+            (Value::Array(a), BinaryOp::Index, Value::Int(i)) => {
+                let arr = a.read().unwrap();
                 let idx = if i < 0 { arr.len() as i64 + i } else { i };
                 if idx < 0 || idx >= arr.len() as i64 {
                     Err(format!(
@@ -943,7 +937,8 @@ impl Engine {
                     Ok(arr[idx as usize].clone())
                 }
             }
-            (Value::Hash(hash), BinaryOp::Index, Value::String(s)) => {
+            (Value::Hash(h), BinaryOp::Index, Value::String(s)) => {
+                let hash = h.read().unwrap();
                 Ok(hash.get(&s).cloned().unwrap_or(Value::Nil))
             }
             (l, BinaryOp::Eq, r) => Ok(Value::Bool(l == r)),
@@ -985,9 +980,24 @@ impl Engine {
             (Value::Int(l), BinaryOp::Div, Value::Float(r)) => Ok(Value::Float(l as f64 / r)),
             (Value::Float(l), BinaryOp::Div, Value::Float(r)) => Ok(Value::Float(l / r)),
 
-            // String concatenation support
-            (Value::String(l), BinaryOp::Add, Value::String(r)) => {
-                Ok(Value::String(format!("{}{}", l, r)))
+            (Value::String(l), BinaryOp::Add, r) => {
+                Ok(Value::String(format!("{}{}", l, r.to_string())))
+            }
+            (l, BinaryOp::Add, Value::String(r)) => {
+                Ok(Value::String(format!("{}{}", l.to_string(), r)))
+            }
+
+            (Value::Array(al), BinaryOp::Add, Value::Array(ar)) => {
+                let l = al.read().unwrap();
+                let r = ar.read().unwrap();
+                let mut new_arr = l.clone();
+                new_arr.extend(r.iter().cloned());
+                Ok(Value::new_array(new_arr))
+            }
+
+            (Value::Int(start), BinaryOp::Range, Value::Int(end)) => {
+                let arr: Vec<Value> = (start..=end).map(Value::Int).collect();
+                Ok(Value::new_array(arr))
             }
 
             _ => Err("Binary operation not supported".to_string()),

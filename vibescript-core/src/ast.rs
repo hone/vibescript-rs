@@ -69,6 +69,7 @@ pub enum BinaryOp {
     And,
     Or,
     Index,
+    Range,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

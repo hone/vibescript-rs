@@ -12,10 +12,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Execute a script file
     Run {
         /// The script file to run
         script: String,
 
+        /// Arguments to pass to the function
+        args: Vec<String>,
+
+        /// Function to invoke after compilation
         #[arg(short, long, default_value = "run")]
         function: String,
 
@@ -23,6 +28,7 @@ enum Commands {
         #[arg(short, long)]
         check: bool,
     },
+    /// Start interactive REPL
     Repl,
 }
 
@@ -33,7 +39,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Run {
             script,
-            function: _,
+            args,
+            function,
             check,
         } => {
             let source = std::fs::read_to_string(&script)
@@ -42,13 +49,13 @@ async fn main() -> anyhow::Result<()> {
             let host = VibesHost::new().context("Failed to initialize VibeScript host")?;
 
             if check {
-                // For now, execute is our only entry point, but it compiles internally.
-                // We'll just run it and see if it fails compilation.
-                // In the future, we might want a explicit compile/check method in host.
-                let _ = host.execute(&source).await.context("Check failed")?;
+                host.check(&source).await.context("Check failed")?;
                 println!("Check successful.");
             } else {
-                let result = host.execute(&source).await.context("Execution failed")?;
+                let result = host
+                    .execute(&source, &function, &args)
+                    .await
+                    .context("Execution failed")?;
                 println!("{}", result);
             }
         }

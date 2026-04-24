@@ -28,7 +28,7 @@ impl VibesHost {
         Ok(Self { engine, linker })
     }
 
-    pub async fn execute(&self, source: &str) -> anyhow::Result<String> {
+    async fn setup_instance(&self) -> anyhow::Result<(wasmtime::Store<HostState>, VibesProvider)> {
         let wasi = wasmtime_wasi::WasiCtxBuilder::new()
             .inherit_stdout()
             .inherit_stderr()
@@ -43,10 +43,43 @@ impl VibesHost {
         );
 
         let component = wasmtime::component::Component::from_binary(&self.engine, VIBES_CORE_WASM)?;
-
         let instance =
             VibesProvider::instantiate_async(&mut store, &component, &self.linker).await?;
 
+        Ok((store, instance))
+    }
+
+    pub async fn check(&self, source: &str) -> anyhow::Result<()> {
+        let (mut store, instance) = self.setup_instance().await?;
+        let engine_world = instance.xipkit_vibes_engine_world();
+
+        let cfg = exports::xipkit::vibes::engine_world::EngineConfig {
+            max_steps: 1000000,
+            max_memory_bytes: 10 * 1024 * 1024,
+        };
+
+        let engine_res = engine_world
+            .engine()
+            .call_constructor(&mut store, cfg)
+            .await?;
+
+        // Compile source
+        let _script = engine_world
+            .engine()
+            .call_compile(&mut store, engine_res, source)
+            .await?
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        Ok(())
+    }
+
+    pub async fn execute(
+        &self,
+        source: &str,
+        function_name: &str,
+        args: &[String],
+    ) -> anyhow::Result<String> {
+        let (mut store, instance) = self.setup_instance().await?;
         let engine_world = instance.xipkit_vibes_engine_world();
 
         let cfg = exports::xipkit::vibes::engine_world::EngineConfig {
@@ -65,14 +98,20 @@ impl VibesHost {
             .engine()
             .call_compile(&mut store, engine_res, source)
             .await?
-            .map_err(|e| anyhow::anyhow!("Compilation failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // Execute script
+        // Convert string args to WitValue::S
+        let wit_args: Vec<exports::xipkit::vibes::engine_world::Value> = args
+            .iter()
+            .map(|s| exports::xipkit::vibes::engine_world::Value::S(s.clone()))
+            .collect();
+
+        // Execute script using the specified function name
         let result = engine_world
             .script()
-            .call_call(&mut store, script, "", &[], &[])
+            .call_call(&mut store, script, function_name, &wit_args, &[])
             .await?
-            .map_err(|e| anyhow::anyhow!("Execution failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         Ok(format!("{:?}", result))
     }
@@ -101,10 +140,24 @@ mod tests {
         let host = VibesHost::new()?;
         // A simple vibescript expression
         let source = "1 + 2";
-        let result = host.execute(source).await?;
+        // Passing empty function name to trigger fallback to last value
+        let result = host.execute(source, "", &[]).await?;
         assert!(
             result.contains("I(3)"),
             "Result should contain I(3), but got: {}",
+            result
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_function_call() -> anyhow::Result<()> {
+        let host = VibesHost::new()?;
+        let source = "def greet(name)\n  \"hello \" + name\nend";
+        let result = host.execute(source, "greet", &["Gwen".to_string()]).await?;
+        assert!(
+            result.contains("S(\"hello Gwen\")"),
+            "Result should contain hello Gwen, but got: {}",
             result
         );
         Ok(())
