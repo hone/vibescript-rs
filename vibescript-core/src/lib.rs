@@ -10,31 +10,38 @@ use ariadne::{Color, Label, Report, ReportKind, Source};
 use chumsky::prelude::*;
 use logos::Logos;
 
-// Generate the WASM Component bindings
+// Generate the WASM Component bindings - only when targeting WASM
+#[cfg(target_arch = "wasm32")]
 wit_bindgen::generate!({
     world: "vibes-provider",
     path: "wit/vibes.wit",
 });
 
+#[cfg(target_arch = "wasm32")]
 use exports::xipkit::vibes::engine_world::{
     EngineConfig, Guest, GuestEngine, GuestScript, NamedValue, Value as WitValue,
 };
 
+#[cfg(target_arch = "wasm32")]
 struct MyEngine;
 
+#[cfg(target_arch = "wasm32")]
 impl Guest for MyEngine {
     type Engine = MyEngineWrapper;
     type Script = MyScriptWrapper;
 }
 
+#[cfg(target_arch = "wasm32")]
 struct MyEngineWrapper {
     _engine: eval::Engine,
 }
 
+#[cfg(target_arch = "wasm32")]
 struct MyScriptWrapper {
     stmts: Vec<ast::Stmt>,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl GuestEngine for MyEngineWrapper {
     fn new(_cfg: EngineConfig) -> Self {
         Self {
@@ -58,6 +65,7 @@ impl GuestEngine for MyEngineWrapper {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 impl GuestScript for MyScriptWrapper {
     fn call(
         &self,
@@ -76,6 +84,7 @@ impl GuestScript for MyScriptWrapper {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn vibe_to_wit(v: value::Value) -> WitValue {
     match v {
         value::Value::Int(i) => WitValue::I(i),
@@ -548,4 +557,5 @@ mod tests {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 export!(MyEngine);
