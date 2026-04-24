@@ -1,0 +1,12 @@
+[package]
+name = "vibescript-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+wasmtime = { version = "44.0.0", features = ["component-model", "async"] }
+wasmtime-wasi =  { version = "44.0.0", features = ["p2"], default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread"] }
