@@ -205,7 +205,6 @@ impl Engine {
                 for stmt in body {
                     let cf = self.eval_stmt(stmt)?;
                     if !cf.is_continue() {
-                        // Normally break/return not allowed in class body, but we'll follow CF
                         self.stack.pop();
                         return Ok(cf);
                     }
@@ -577,6 +576,26 @@ impl Engine {
             (Value::Array(a), "length" | "size", _) => {
                 return Ok(Value::Int(a.read().unwrap().len() as i64));
             }
+            (Value::Array(a), "first", _) => {
+                let arr = a.read().unwrap();
+                if let Some(Value::Int(n)) = args.first() {
+                    let count = (*n).max(0) as usize;
+                    let taken = arr.iter().take(count).cloned().collect();
+                    return Ok(Value::new_array(taken));
+                } else {
+                    return Ok(arr.first().cloned().unwrap_or(Value::Nil));
+                }
+            }
+            (Value::Array(a), "sum", _) => {
+                let arr = a.read().unwrap();
+                let mut total = 0;
+                for val in arr.iter() {
+                    if let Value::Int(i) = val {
+                        total += i;
+                    }
+                }
+                return Ok(Value::Int(total));
+            }
             (Value::String(s), "length" | "size", _) => return Ok(Value::Int(s.len() as i64)),
             (Value::Hash(h), "length" | "size", _) => {
                 return Ok(Value::Int(h.read().unwrap().len() as i64));
@@ -649,6 +668,30 @@ impl Engine {
                 Ok(Value::Instance(inst))
             }
 
+            (Value::EnumVariant { variant_name, .. }, "name", _) => {
+                Ok(Value::String(variant_name.clone()))
+            }
+            (Value::EnumVariant { variant_name, .. }, "symbol", _) => {
+                Ok(Value::Symbol(variant_name.to_lowercase()))
+            }
+
+            (Value::Hash(h), "[]=", _) => {
+                if args.len() < 2 {
+                    return Err(EvalError::Message(
+                        "[]= expects a key and a value".to_string(),
+                    ));
+                }
+                let key_val = &args[0];
+                let new_val = &args[1];
+                if let Value::String(s) = key_val {
+                    let mut hash = h.write().unwrap();
+                    hash.insert(s.clone(), new_val.clone());
+                    Ok(new_val.clone())
+                } else {
+                    Err(EvalError::Message("Hash key must be a string".to_string()))
+                }
+            }
+
             (Value::Hash(h), method, _) => {
                 let hash = h.read().unwrap();
                 if let Some(val) = hash.get(method).cloned() {
@@ -659,13 +702,6 @@ impl Engine {
                         method
                     )))
                 }
-            }
-
-            (Value::EnumVariant { variant_name, .. }, "name", _) => {
-                Ok(Value::String(variant_name.clone()))
-            }
-            (Value::EnumVariant { variant_name, .. }, "symbol", _) => {
-                Ok(Value::Symbol(variant_name.to_lowercase()))
             }
 
             (_, "to_string", _) => Ok(Value::String(receiver.to_string())),
@@ -795,23 +831,6 @@ impl Engine {
                 }
             }
 
-            (Value::Hash(h), "[]=", _) => {
-                if args.len() < 2 {
-                    return Err(EvalError::Message(
-                        "[]= expects a key and a value".to_string(),
-                    ));
-                }
-                let key_val = &args[0];
-                let new_val = &args[1];
-                if let Value::String(s) = key_val {
-                    let mut hash = h.write().unwrap();
-                    hash.insert(s.clone(), new_val.clone());
-                    Ok(new_val.clone())
-                } else {
-                    Err(EvalError::Message("Hash key must be a string".to_string()))
-                }
-            }
-
             (Value::Array(a), "each", Some(Expr::Block { params, body })) => {
                 let arr = a.read().unwrap().clone();
                 for val in arr {
@@ -910,7 +929,7 @@ impl Engine {
         let cf = self.eval_block(&func.body)?;
         self.stack.pop();
 
-        Ok(ControlFlow::Continue(cf.value()))
+        Ok(cf)
     }
 
     fn eval_unary(&self, op: UnaryOp, val: &Value) -> Result<Value, String> {

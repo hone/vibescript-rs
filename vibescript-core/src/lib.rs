@@ -107,7 +107,30 @@ fn wit_to_vibe(engine: &eval::Engine, w: WitValue) -> value::Value {
     match w {
         WitValue::I(i) => value::Value::Int(i),
         WitValue::F(f) => value::Value::Float(f),
-        WitValue::S(s) => value::Value::String(s),
+        WitValue::S(s) => {
+            // Try to parse string as integer or float first (common in CLI args)
+            if let Ok(i) = s.parse::<i64>() {
+                value::Value::Int(i)
+            } else if let Ok(f) = s.parse::<f64>() {
+                value::Value::Float(f)
+            } else if s == "true" {
+                value::Value::Bool(true)
+            } else if s == "false" {
+                value::Value::Bool(false)
+            } else if s == "nil" {
+                value::Value::Nil
+            } else if (s.starts_with('[') && s.ends_with(']'))
+                || (s.starts_with('{') && s.ends_with('}'))
+            {
+                if let Ok(json_val) = serde_json::from_str(&s) {
+                    engine.json_to_vibe(json_val)
+                } else {
+                    value::Value::String(s)
+                }
+            } else {
+                value::Value::String(s)
+            }
+        }
         WitValue::B(b) => value::Value::Bool(b),
         WitValue::Json(s) => {
             if let Ok(json_val) = serde_json::from_str(&s) {
