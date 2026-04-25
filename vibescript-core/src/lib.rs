@@ -153,6 +153,8 @@ fn vibe_to_wit(engine: &eval::Engine, v: value::Value) -> WitValue {
         value::Value::Bool(b) => WitValue::B(b),
         value::Value::Nil => WitValue::None,
         value::Value::Time(t) => WitValue::S(t.to_rfc3339()),
+        value::Value::Duration(s) => WitValue::I(s),
+        value::Value::Money { .. } => WitValue::S(v.to_string()),
         value::Value::EnumVariant {
             enum_name,
             variant_name,
@@ -464,6 +466,64 @@ mod tests {
 
         let source = "{a: 1, b: 2}.keys().length()";
         assert_eq!(execute(source).unwrap(), Value::Int(2));
+    }
+
+    #[test]
+    fn test_string_methods_expanded() {
+        let cases = vec![
+            ("\"Gwen\".upcase()", Value::String("GWEN".to_string())),
+            ("\"Gwen\".downcase()", Value::String("gwen".to_string())),
+            ("\"gwen\".capitalize()", Value::String("Gwen".to_string())),
+            ("\"Gwen\".swapcase()", Value::String("gWEN".to_string())),
+            ("\"gwen\".reverse()", Value::String("newg".to_string())),
+            ("\"\".empty?()", Value::Bool(true)),
+            ("\"gwen\".empty?()", Value::Bool(false)),
+            ("\"gwen\".start_with?(\"gw\")", Value::Bool(true)),
+            ("\"gwen\".end_with?(\"en\")", Value::Bool(true)),
+            ("\"  gwen  \".lstrip()", Value::String("gwen  ".to_string())),
+            ("\"  gwen  \".rstrip()", Value::String("  gwen".to_string())),
+            ("\"  gwen  \".strip()", Value::String("gwen".to_string())),
+            (
+                "\"prefix_gwen\".delete_prefix(\"prefix_\")",
+                Value::String("gwen".to_string()),
+            ),
+            (
+                "\"gwen_suffix\".delete_suffix(\"_suffix\")",
+                Value::String("gwen".to_string()),
+            ),
+            ("\"gwen\".clear()", Value::String("".to_string())),
+            (
+                "\"gwen\".concat(\" is \", 25)",
+                Value::String("gwen is 25".to_string()),
+            ),
+            ("\"hé\".bytesize()", Value::Int(3)), // h is 1, é is 2 bytes
+            ("\"h\".ord()", Value::Int(104)),
+            ("\"hé\".chr()", Value::String("h".to_string())),
+            (
+                "\"a b c\".split()",
+                Value::new_array(vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                    Value::String("c".to_string()),
+                ]),
+            ),
+            (
+                "\"a,b,c\".split(\",\")",
+                Value::new_array(vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                    Value::String("c".to_string()),
+                ]),
+            ),
+            ("\"hello\".index(\"e\")", Value::Int(1)),
+            ("\"hello\".rindex(\"l\")", Value::Int(3)),
+            ("\"hello\".index(\"z\")", Value::Nil),
+        ];
+
+        for (source, expected) in cases {
+            let result = execute(source).unwrap();
+            assert_eq!(result, expected, "Failed on: {}", source);
+        }
     }
 
     #[test]

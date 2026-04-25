@@ -18,6 +18,11 @@ pub enum Value {
     String(String),
     Symbol(String),
     Time(DateTime<Utc>),
+    Duration(i64), // Seconds
+    Money {
+        cents: i64,
+        currency: String,
+    },
     EnumVariant {
         enum_name: String,
         variant_name: String,
@@ -30,6 +35,8 @@ pub enum Value {
     },
     Class(Arc<ClassDef>),
     Instance(Arc<RwLock<InstanceData>>),
+    Builtin(String),
+    Namespace(String),
 }
 
 impl Serialize for Value {
@@ -45,6 +52,13 @@ impl Serialize for Value {
             Value::String(s) => serializer.serialize_str(s),
             Value::Symbol(s) => serializer.serialize_str(&format!(":{}", s)),
             Value::Time(t) => serializer.serialize_str(&t.to_rfc3339()),
+            Value::Duration(s) => serializer.serialize_str(&format!("{}s", s)),
+            Value::Money { cents, currency } => serializer.serialize_str(&format!(
+                "{}.{:02} {}",
+                cents / 100,
+                cents % 100,
+                currency
+            )),
             Value::EnumVariant {
                 enum_name,
                 variant_name,
@@ -63,6 +77,8 @@ impl Serialize for Value {
                 let inst = i.read().unwrap();
                 serializer.serialize_str(&format!("<instance of {}>", inst.class.name))
             }
+            Value::Builtin(name) => serializer.serialize_str(&format!("<builtin {}>", name)),
+            Value::Namespace(name) => serializer.serialize_str(&format!("<namespace {}>", name)),
         }
     }
 }
@@ -121,6 +137,17 @@ impl PartialEq for Value {
             (Value::String(l), Value::String(r)) => l == r,
             (Value::Symbol(l), Value::Symbol(r)) => l == r,
             (Value::Time(l), Value::Time(r)) => l == r,
+            (Value::Duration(l), Value::Duration(r)) => l == r,
+            (
+                Value::Money {
+                    cents: cl,
+                    currency: curl,
+                },
+                Value::Money {
+                    cents: cr,
+                    currency: curr,
+                },
+            ) => cl == cr && curl == curr,
             (
                 Value::EnumVariant {
                     enum_name: el,
@@ -157,6 +184,8 @@ impl PartialEq for Value {
             }
             (Value::Class(l), Value::Class(r)) => Arc::ptr_eq(l, r),
             (Value::Instance(l), Value::Instance(r)) => Arc::ptr_eq(l, r),
+            (Value::Builtin(l), Value::Builtin(r)) => l == r,
+            (Value::Namespace(l), Value::Namespace(r)) => l == r,
             _ => false,
         }
     }
@@ -179,6 +208,7 @@ impl Value {
         match self {
             Value::Int(i) => Some(*i),
             Value::Float(f) => Some(*f as i64),
+            Value::String(s) => s.parse::<i64>().ok(),
             _ => None,
         }
     }
@@ -187,7 +217,23 @@ impl Value {
         match self {
             Value::Float(f) => Some(*f),
             Value::Int(i) => Some(*i as f64),
+            Value::String(s) => s.parse::<f64>().ok(),
             _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Value::Nil => false,
+            Value::Bool(b) => *b,
+            _ => true,
         }
     }
 
@@ -200,6 +246,10 @@ impl Value {
             Value::String(s) => s.clone(),
             Value::Symbol(s) => format!(":{}", s),
             Value::Time(t) => t.to_rfc3339(),
+            Value::Duration(s) => format!("{}s", s),
+            Value::Money { cents, currency } => {
+                format!("{}.{:02} {}", cents / 100, cents % 100, currency)
+            }
             Value::EnumVariant {
                 enum_name,
                 variant_name,
@@ -221,6 +271,8 @@ impl Value {
             Value::Block { .. } => "block".to_string(),
             Value::Class(c) => format!("<class {}>", c.name),
             Value::Instance(i) => format!("<instance of {}>", i.read().unwrap().class.name),
+            Value::Builtin(name) => format!("<builtin {}>", name),
+            Value::Namespace(name) => format!("<namespace {}>", name),
         }
     }
 }

@@ -11,6 +11,7 @@ wasmtime::component::bindgen!({
 pub struct VibesHost {
     engine: Engine,
     linker: Linker<HostState>,
+    component: wasmtime::component::Component,
 }
 
 const VIBES_CORE_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vibescript_core.wasm"));
@@ -19,13 +20,20 @@ impl VibesHost {
     pub fn new() -> anyhow::Result<VibesHost> {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
+        config.async_support(true);
 
         let engine = Engine::new(&config)?;
         let mut linker = Linker::new(&engine);
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-        Ok(Self { engine, linker })
+        let component = wasmtime::component::Component::from_binary(&engine, VIBES_CORE_WASM)?;
+
+        Ok(Self {
+            engine,
+            linker,
+            component,
+        })
     }
 
     async fn setup_instance(&self) -> anyhow::Result<(wasmtime::Store<HostState>, VibesProvider)> {
@@ -42,9 +50,8 @@ impl VibesHost {
             },
         );
 
-        let component = wasmtime::component::Component::from_binary(&self.engine, VIBES_CORE_WASM)?;
         let instance =
-            VibesProvider::instantiate_async(&mut store, &component, &self.linker).await?;
+            VibesProvider::instantiate_async(&mut store, &self.component, &self.linker).await?;
 
         Ok((store, instance))
     }

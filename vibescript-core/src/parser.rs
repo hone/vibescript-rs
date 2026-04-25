@@ -30,6 +30,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             just(Token::Until).to("until".to_string()),
             just(Token::For).to("for".to_string()),
             just(Token::Return).to("return".to_string()),
+            just(Token::Assert).to("assert".to_string()),
             just(Token::True).to("true".to_string()),
             just(Token::False).to("false".to_string()),
             just(Token::Nil).to("nil".to_string()),
@@ -44,9 +45,11 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             just(Token::Property).to("property".to_string()),
             just(Token::Getter).to("getter".to_string()),
             just(Token::Setter).to("setter".to_string()),
+        ))
+        .or(choice((
             just(Token::Private).to("private".to_string()),
             just(Token::Def).to("def".to_string()),
-        ))
+        )))
         .boxed();
 
         let member_name_parser = name_parser.clone().or(keyword_name_parser).boxed();
@@ -190,11 +193,18 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                             )
                             .then(block_lit.clone().or_not())
                             .map(|((name, args), block)| {
-                                ("member", args.unwrap_or_default(), name, block)
+                                (
+                                    "member",
+                                    args.unwrap_or_default() as Vec<(Option<String>, Expr)>,
+                                    name,
+                                    block,
+                                )
                             }),
                         just(Token::ColonColon)
                             .ignore_then(member_name_parser.clone())
-                            .map(|name| ("member", vec![], name, None)),
+                            .map(|name| {
+                                ("member", vec![] as Vec<(Option<String>, Expr)>, name, None)
+                            }),
                     ))
                     .repeated(),
                     |lhs, (kind, args_with_names, name, block)| {
@@ -230,6 +240,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                                 receiver: Box::new(lhs),
                                 method: name,
                                 args,
+                                kwargs,
                                 block: block.map(Box::new),
                             },
                             _ => unreachable!(),
@@ -366,10 +377,13 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                 )
                 .then(just(Token::Else).ignore_then(block_body.clone()).or_not())
                 .then_ignore(just(Token::End))
-                .map(|((target, clauses), else_expr)| Expr::Case {
-                    target: Box::new(target.unwrap_or(Expr::Literal(Value::Bool(true)))),
-                    clauses,
-                    else_expr,
+                .map(|((target, clauses), else_expr)| {
+                    let target = target as Option<Expr>;
+                    Expr::Case {
+                        target: Box::new(target.unwrap_or(Expr::Literal(Value::Bool(true)))),
+                        clauses,
+                        else_expr,
+                    }
                 })
                 .boxed();
 
@@ -459,6 +473,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             .then_ignore(just(Token::End))
             .map(
                 |((((is_private, (name, is_class_method)), params), _ret_type), body)| {
+                    let is_private = is_private as Option<Token>;
                     Stmt::Function(FunctionStmt {
                         name,
                         params,
@@ -516,6 +531,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                         receiver: Box::new(Expr::Variable(receiver)),
                         method: format!("{}=", method),
                         args: vec![value],
+                        kwargs: vec![],
                         block: None,
                     })
                 }),
@@ -534,6 +550,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                         receiver: Box::new(Expr::Variable(receiver)),
                         method: "[]=".to_string(),
                         args: vec![index, value],
+                        kwargs: vec![],
                         block: None,
                     })
                 }),
@@ -559,6 +576,12 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
         let return_stmt = just(Token::Return)
             .ignore_then(expr.clone().or_not())
             .map(Stmt::Return)
+            .boxed();
+
+        let assert_stmt = just(Token::Assert)
+            .ignore_then(expr.clone())
+            .then(just(Token::Comma).ignore_then(expr.clone()).or_not())
+            .map(|(condition, message)| Stmt::Assert { condition, message })
             .boxed();
 
         let begin_stmt = just(Token::Begin)
@@ -599,6 +622,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             class_stmt,
             property_stmt,
             return_stmt,
+            assert_stmt,
             break_stmt,
             next_stmt,
             begin_stmt,

@@ -55,6 +55,8 @@ pub enum Token {
     Private,
     #[token("return")]
     Return,
+    #[token("assert")]
+    Assert,
     #[token("true")]
     True,
     #[token("false")]
@@ -173,6 +175,7 @@ impl fmt::Display for Token {
             Token::Setter => write!(f, "setter"),
             Token::Private => write!(f, "private"),
             Token::Return => write!(f, "return"),
+            Token::Assert => write!(f, "assert"),
             Token::True => write!(f, "true"),
             Token::False => write!(f, "false"),
             Token::Nil => write!(f, "nil"),

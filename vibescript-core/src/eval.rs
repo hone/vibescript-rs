@@ -1,6 +1,8 @@
 use crate::ast::*;
 use crate::value::{ClassDef, FunctionDef, InstanceData, Param, Value};
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
+use rand::{Rng, distributions::Alphanumeric};
+use regex::Regex;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -52,8 +54,13 @@ impl ControlFlow {
 
 impl Engine {
     pub fn new() -> Self {
+        let mut globals = HashMap::new();
+        globals.insert("JSON".to_string(), Value::Namespace("JSON".to_string()));
+        globals.insert("Time".to_string(), Value::Namespace("Time".to_string()));
+        globals.insert("Regex".to_string(), Value::Namespace("Regex".to_string()));
+
         Self {
-            globals: HashMap::new(),
+            globals,
             stack: vec![HashMap::new()],
             functions: HashMap::new(),
             classes: HashMap::new(),
@@ -253,6 +260,18 @@ impl Engine {
                 };
                 Ok(ControlFlow::Return(val))
             }
+            Stmt::Assert { condition, message } => {
+                let cond = self.eval_expr(condition)?;
+                if !self.is_truthy(&cond) {
+                    let msg = if let Some(m) = message {
+                        self.eval_expr(m)?.to_string()
+                    } else {
+                        "assertion failed".to_string()
+                    };
+                    return Err(EvalError::Message(msg));
+                }
+                Ok(ControlFlow::Continue(Value::Nil))
+            }
             Stmt::Break => Ok(ControlFlow::Break(Value::Nil)),
             Stmt::Next => Ok(ControlFlow::Next(Value::Nil)),
             Stmt::Try {
@@ -282,9 +301,13 @@ impl Engine {
     pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, EvalError> {
         match expr {
             Expr::Literal(val) => Ok(val.clone()),
-            Expr::Variable(name) => self
-                .get_var(name)
-                .ok_or_else(|| EvalError::Message(format!("Variable '{}' not found", name))),
+            Expr::Variable(name) => {
+                if name == "uuid" {
+                    return Ok(Value::String(Uuid::new_v4().to_string()));
+                }
+                self.get_var(name)
+                    .ok_or_else(|| EvalError::Message(format!("Variable '{}' not found", name)))
+            }
             Expr::InstanceVar(name) => self.get_ivar(name).map_err(EvalError::Message),
             Expr::ClassVar(name) => self.get_cvar(name).map_err(EvalError::Message),
             Expr::Binary { left, op, right } => {
@@ -313,7 +336,7 @@ impl Engine {
             Expr::Call {
                 func,
                 args,
-                kwargs: _,
+                kwargs,
                 block,
             } => {
                 let mut arg_vals = Vec::new();
@@ -321,10 +344,32 @@ impl Engine {
                     arg_vals.push(self.eval_expr(arg)?);
                 }
 
+                let mut kwarg_vals = HashMap::new();
+                for (name, val_expr) in kwargs {
+                    kwarg_vals.insert(name.clone(), self.eval_expr(val_expr)?);
+                }
+
                 match func.as_str() {
                     "money" => {
                         if let Some(Value::String(s)) = arg_vals.first() {
-                            return Ok(Value::String(format!("{} (money)", s)));
+                            // "50.00 USD" -> 5000 cents
+                            let parts: Vec<&str> = s.split_whitespace().collect();
+                            if parts.len() == 2 {
+                                let amount: f64 = parts[0].parse().unwrap_or(0.0);
+                                let cents = (amount * 100.0).round() as i64;
+                                let currency = parts[1].to_string();
+                                return Ok(Value::Money { cents, currency });
+                            }
+                        }
+                    }
+                    "money_cents" => {
+                        if let Some(cents) = arg_vals.get(0).and_then(|v| v.as_int()) {
+                            if let Some(Value::String(currency)) = arg_vals.get(1) {
+                                return Ok(Value::Money {
+                                    cents,
+                                    currency: currency.clone(),
+                                });
+                            }
                         }
                     }
                     "json_parse" => {
@@ -337,6 +382,29 @@ impl Engine {
                     }
                     "uuid" => return Ok(Value::String(Uuid::new_v4().to_string())),
                     "now" => return Ok(Value::Time(Utc::now())),
+                    "to_int" => {
+                        return Ok(arg_vals
+                            .first()
+                            .and_then(|v| v.as_int())
+                            .map(Value::Int)
+                            .unwrap_or(Value::Nil));
+                    }
+                    "to_float" => {
+                        return Ok(arg_vals
+                            .first()
+                            .and_then(|v| v.as_float())
+                            .map(Value::Float)
+                            .unwrap_or(Value::Nil));
+                    }
+                    "random_id" => {
+                        let len = arg_vals.first().and_then(|v| v.as_int()).unwrap_or(16) as usize;
+                        let s: String = rand::thread_rng()
+                            .sample_iter(&Alphanumeric)
+                            .take(len)
+                            .map(char::from)
+                            .collect();
+                        return Ok(Value::String(s));
+                    }
                     _ => {}
                 }
 
@@ -363,6 +431,7 @@ impl Engine {
                 receiver,
                 method,
                 args,
+                kwargs,
                 block,
             } => {
                 let recv_val = self.eval_expr(receiver)?;
@@ -370,7 +439,11 @@ impl Engine {
                 for arg in args {
                     arg_vals.push(self.eval_expr(arg)?);
                 }
-                self.eval_member(recv_val, method, arg_vals, block.as_deref())
+                let mut kwarg_vals = HashMap::new();
+                for (name, val_expr) in kwargs {
+                    kwarg_vals.insert(name.clone(), self.eval_expr(val_expr)?);
+                }
+                self.eval_member(recv_val, method, arg_vals, kwarg_vals, block.as_deref())
             }
             Expr::Array(elements) => {
                 let mut vals = Vec::new();
@@ -536,6 +609,13 @@ impl Engine {
             Value::String(s) => serde_json::Value::String(s),
             Value::Symbol(s) => serde_json::Value::String(format!(":{}", s)),
             Value::Time(t) => serde_json::Value::String(t.to_rfc3339()),
+            Value::Duration(s) => serde_json::Value::String(format!("{}s", s)),
+            Value::Money { cents, currency } => serde_json::Value::String(format!(
+                "{}.{:02} {}",
+                cents / 100,
+                cents % 100,
+                currency
+            )),
             Value::EnumVariant {
                 enum_name,
                 variant_name,
@@ -569,8 +649,84 @@ impl Engine {
         receiver: Value,
         method: &str,
         args: Vec<Value>,
+        kwargs: HashMap<String, Value>,
         block: Option<&Expr>,
     ) -> Result<Value, EvalError> {
+        if let Value::Namespace(ref ns) = receiver {
+            match (ns.as_str(), method) {
+                ("JSON", "parse") => {
+                    if let Some(Value::String(s)) = args.first() {
+                        let v: serde_json::Value = serde_json::from_str(s)
+                            .map_err(|e| EvalError::Message(format!("JSON parse error: {}", e)))?;
+                        return Ok(self.json_to_vibe(v));
+                    }
+                }
+                ("JSON", "stringify") => {
+                    if let Some(v) = args.first() {
+                        let json = self.vibe_to_json(v.clone());
+                        let s = serde_json::to_string(&json).map_err(|e| {
+                            EvalError::Message(format!("JSON stringify error: {}", e))
+                        })?;
+                        return Ok(Value::String(s));
+                    }
+                }
+                ("Time", "now") => {
+                    return Ok(Value::Time(Utc::now()));
+                }
+                ("Time", "parse") => {
+                    if let Some(Value::String(s)) = args.first() {
+                        // Try various formats
+                        let t = DateTime::parse_from_rfc3339(s)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .or_else(|_| {
+                                DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S %z")
+                                    .map(|dt| dt.with_timezone(&Utc))
+                            })
+                            .or_else(|_| Utc.datetime_from_str(s, "%Y-%m-%d %H:%M:%S"))
+                            .or_else(|_| Utc.datetime_from_str(s, "%Y-%m-%d"))
+                            .map_err(|e| EvalError::Message(format!("Time parse error: {}", e)))?;
+                        return Ok(Value::Time(t));
+                    }
+                }
+                ("Regex", "match") => {
+                    let pattern = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                    let s = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                    let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                    if let Some(caps) = re.captures(s) {
+                        let groups: Vec<Value> = caps
+                            .iter()
+                            .map(|m| {
+                                m.map_or(Value::Nil, |mat| Value::String(mat.as_str().to_string()))
+                            })
+                            .collect();
+                        return Ok(Value::new_array(groups));
+                    } else {
+                        return Ok(Value::Nil);
+                    }
+                }
+                ("Regex", "replace") => {
+                    let s = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                    let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                    let replacement = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+                    let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                    return Ok(Value::String(re.replace(s, replacement).to_string()));
+                }
+                ("Regex", "replace_all") => {
+                    let s = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                    let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                    let replacement = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+                    let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                    return Ok(Value::String(re.replace_all(s, replacement).to_string()));
+                }
+                _ => {
+                    return Err(EvalError::Message(format!(
+                        "Method '{}' not found for namespace '{}'",
+                        method, ns
+                    )));
+                }
+            }
+        }
+
         // High priority: Standard methods
         match (receiver.clone(), method, block) {
             (Value::Array(a), "length" | "size", _) => {
@@ -609,6 +765,19 @@ impl Engine {
                 let hash = h.read().unwrap();
                 let values = hash.values().cloned().collect();
                 return Ok(Value::new_array(values));
+            }
+            (Value::Hash(h), "fetch", _) => {
+                let hash = h.read().unwrap();
+                if let Some(Value::String(key)) = args.first() {
+                    if let Some(val) = hash.get(key).cloned() {
+                        return Ok(val);
+                    }
+                    if let Some(default) = args.get(1) {
+                        return Ok(default.clone());
+                    }
+                    return Err(EvalError::Message(format!("Key '{}' not found", key)));
+                }
+                return Err(EvalError::Message("fetch expects a key".to_string()));
             }
             (Value::Hash(h), "merge", _) => {
                 if let Some(Value::Hash(other_h)) = args.first() {
@@ -675,6 +844,29 @@ impl Engine {
                 Ok(Value::Symbol(variant_name.to_lowercase()))
             }
 
+            (Value::Time(t), "format", _) => {
+                if let Some(Value::String(fmt)) = args.first() {
+                    let rust_fmt = match fmt.as_str() {
+                        "2006-01-02T15:04:05Z07:00" => "%Y-%m-%dT%H:%M:%S%Z",
+                        _ => fmt,
+                    };
+                    return Ok(Value::String(t.format(rust_fmt).to_string()));
+                }
+                Ok(Value::String(t.to_rfc3339()))
+            }
+
+            (Value::Duration(s), "seconds", _) => Ok(Value::Int(s)),
+
+            (Value::Int(i), "minutes", _) => Ok(Value::Duration(i * 60)),
+            (Value::Int(i), "hours", _) => Ok(Value::Duration(i * 3600)),
+            (Value::Int(i), "days", _) => Ok(Value::Duration(i * 86400)),
+            (Value::Int(i), "seconds", _) => Ok(Value::Duration(i)),
+
+            (Value::Float(f), "minutes", _) => Ok(Value::Duration((f * 60.0) as i64)),
+            (Value::Float(f), "hours", _) => Ok(Value::Duration((f * 3600.0) as i64)),
+            (Value::Float(f), "days", _) => Ok(Value::Duration((f * 86400.0) as i64)),
+            (Value::Float(f), "seconds", _) => Ok(Value::Duration(f as i64)),
+
             (Value::Hash(h), "[]=", _) => {
                 if args.len() < 2 {
                     return Err(EvalError::Message(
@@ -706,8 +898,48 @@ impl Engine {
 
             (_, "to_string", _) => Ok(Value::String(receiver.to_string())),
 
-            (Value::String(s), "uppercase", _) => Ok(Value::String(s.to_uppercase())),
-            (Value::String(s), "lowercase", _) => Ok(Value::String(s.to_lowercase())),
+            (Value::String(s), "uppercase" | "upcase", _) => Ok(Value::String(s.to_uppercase())),
+            (Value::String(s), "lowercase" | "downcase", _) => Ok(Value::String(s.to_lowercase())),
+            (Value::String(s), "capitalize", _) => {
+                let mut c = s.chars();
+                match c.next() {
+                    None => Ok(Value::String(String::new())),
+                    Some(f) => Ok(Value::String(
+                        f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                    )),
+                }
+            }
+            (Value::String(s), "swapcase", _) => {
+                let swapped = s
+                    .chars()
+                    .map(|c| {
+                        if c.is_uppercase() {
+                            c.to_lowercase().to_string()
+                        } else {
+                            c.to_uppercase().to_string()
+                        }
+                    })
+                    .collect::<String>();
+                Ok(Value::String(swapped))
+            }
+            (Value::String(s), "reverse", _) => {
+                Ok(Value::String(s.chars().rev().collect::<String>()))
+            }
+            (Value::String(s), "empty?", _) => Ok(Value::Bool(s.is_empty())),
+            (Value::String(s), "start_with?" | "starts_with?", _) => {
+                if let Some(Value::String(prefix)) = args.first() {
+                    Ok(Value::Bool(s.starts_with(prefix)))
+                } else {
+                    Ok(Value::Bool(false))
+                }
+            }
+            (Value::String(s), "end_with?" | "ends_with?", _) => {
+                if let Some(Value::String(suffix)) = args.first() {
+                    Ok(Value::Bool(s.ends_with(suffix)))
+                } else {
+                    Ok(Value::Bool(false))
+                }
+            }
             (Value::String(s), "contains?" | "include?", _) => {
                 if let Some(Value::String(sub)) = args.first() {
                     Ok(Value::Bool(s.contains(sub)))
@@ -715,7 +947,275 @@ impl Engine {
                     Ok(Value::Bool(false))
                 }
             }
+            (Value::String(s), "lstrip", _) => Ok(Value::String(s.trim_start().to_string())),
+            (Value::String(s), "rstrip", _) => Ok(Value::String(s.trim_end().to_string())),
+            (Value::String(s), "strip!", _) => {
+                let trimmed = s.trim();
+                if trimmed == s {
+                    Ok(Value::Nil)
+                } else {
+                    Ok(Value::String(trimmed.to_string()))
+                }
+            }
             (Value::String(s), "strip", _) => Ok(Value::String(s.trim().to_string())),
+            (Value::String(s), "replace", _) => {
+                if let Some(new_val) = args.first() {
+                    Ok(Value::String(new_val.to_string()))
+                } else {
+                    Ok(Value::String(s.clone()))
+                }
+            }
+            (Value::String(s), "delete_prefix", _) => {
+                if let Some(Value::String(prefix)) = args.first() {
+                    let result = s.strip_prefix(prefix).unwrap_or(&s).to_string();
+                    if result == s {
+                        Ok(Value::String(s.clone()))
+                    } else {
+                        Ok(Value::String(result))
+                    }
+                } else {
+                    Ok(Value::String(s.clone()))
+                }
+            }
+            (Value::String(s), "delete_suffix", _) => {
+                if let Some(Value::String(suffix)) = args.first() {
+                    let result = s.strip_suffix(suffix).unwrap_or(&s).to_string();
+                    if result == s {
+                        Ok(Value::String(s.clone()))
+                    } else {
+                        Ok(Value::String(result))
+                    }
+                } else {
+                    Ok(Value::String(s.clone()))
+                }
+            }
+            (Value::String(_), "clear", _) => Ok(Value::String(String::new())),
+            (Value::String(s), "concat", _) => {
+                let mut result = s.clone();
+                for arg in args {
+                    result.push_str(&arg.to_string());
+                }
+                Ok(Value::String(result))
+            }
+            (Value::String(s), "bytesize", _) => Ok(Value::Int(s.len() as i64)),
+            (Value::String(s), "ord", _) => {
+                if let Some(c) = s.chars().next() {
+                    Ok(Value::Int(c as i64))
+                } else {
+                    Err(EvalError::Message("empty string".to_string()))
+                }
+            }
+            (Value::String(s), "chr", _) => {
+                if let Some(c) = s.chars().next() {
+                    Ok(Value::String(c.to_string()))
+                } else {
+                    Ok(Value::String(String::new()))
+                }
+            }
+            (Value::String(s), "split", _) => {
+                let sep = if let Some(Value::String(sep)) = args.first() {
+                    Some(sep.as_str())
+                } else {
+                    None
+                };
+
+                let parts = if let Some(sep) = sep {
+                    if sep.is_empty() {
+                        s.chars().map(|c| Value::String(c.to_string())).collect()
+                    } else {
+                        s.split(sep)
+                            .map(|part| Value::String(part.to_string()))
+                            .collect()
+                    }
+                } else {
+                    s.split_whitespace()
+                        .map(|part| Value::String(part.to_string()))
+                        .collect()
+                };
+                Ok(Value::new_array(parts))
+            }
+            (Value::String(s), "index", _) => {
+                if let Some(Value::String(sub)) = args.first() {
+                    if let Some(idx) = s.find(sub) {
+                        // Use character index for UTF-8 compatibility
+                        let char_idx = s[..idx].chars().count();
+                        Ok(Value::Int(char_idx as i64))
+                    } else {
+                        Ok(Value::Nil)
+                    }
+                } else {
+                    Ok(Value::Nil)
+                }
+            }
+            (Value::String(s), "rindex", _) => {
+                if let Some(Value::String(sub)) = args.first() {
+                    if let Some(idx) = s.rfind(sub) {
+                        // Use character index for UTF-8 compatibility
+                        let char_idx = s[..idx].chars().count();
+                        Ok(Value::Int(char_idx as i64))
+                    } else {
+                        Ok(Value::Nil)
+                    }
+                } else {
+                    Ok(Value::Nil)
+                }
+            }
+            (Value::String(s), "sub" | "sub!" | "gsub" | "gsub!", _) => {
+                let pattern = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                let replacement = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                let is_regex = kwargs
+                    .get("regex")
+                    .map(|v| self.is_truthy(v))
+                    .unwrap_or(false);
+                let all = method.contains("gsub");
+
+                let result = if is_regex {
+                    let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                    if all {
+                        re.replace_all(&s, replacement).to_string()
+                    } else {
+                        re.replace(&s, replacement).to_string()
+                    }
+                } else {
+                    if all {
+                        s.replace(pattern, replacement)
+                    } else {
+                        s.replacen(pattern, replacement, 1)
+                    }
+                };
+
+                if method.ends_with('!') {
+                    if result == s {
+                        Ok(Value::Nil)
+                    } else {
+                        Ok(Value::String(result))
+                    }
+                } else {
+                    Ok(Value::String(result))
+                }
+            }
+            (Value::String(s), "match", _) => {
+                let pattern = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                if let Some(caps) = re.captures(&s) {
+                    let groups: Vec<Value> = caps
+                        .iter()
+                        .map(|m| {
+                            m.map_or(Value::Nil, |mat| Value::String(mat.as_str().to_string()))
+                        })
+                        .collect();
+                    Ok(Value::new_array(groups))
+                } else {
+                    Ok(Value::Nil)
+                }
+            }
+            (Value::String(s), "scan", _) => {
+                let pattern = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                let matches: Vec<Value> = re
+                    .find_iter(&s)
+                    .map(|mat| Value::String(mat.as_str().to_string()))
+                    .collect();
+                Ok(Value::new_array(matches))
+            }
+            (Value::String(s), "slice", _) => {
+                let chars: Vec<char> = s.chars().collect();
+                if args.len() == 1 {
+                    if let Value::Int(i) = args[0] {
+                        let idx = if i < 0 { chars.len() as i64 + i } else { i } as usize;
+                        Ok(chars
+                            .get(idx)
+                            .map_or(Value::Nil, |c| Value::String(c.to_string())))
+                    } else {
+                        Ok(Value::Nil)
+                    }
+                } else if args.len() >= 2 {
+                    if let (Value::Int(start), Value::Int(len)) = (&args[0], &args[1]) {
+                        let start_idx = if *start < 0 {
+                            chars.len() as i64 + *start
+                        } else {
+                            *start
+                        } as usize;
+                        let end_idx = (start_idx + (*len as usize)).min(chars.len());
+                        if start_idx >= chars.len() {
+                            Ok(Value::Nil)
+                        } else {
+                            let sub: String = chars[start_idx..end_idx].iter().collect();
+                            Ok(Value::String(sub))
+                        }
+                    } else {
+                        Ok(Value::Nil)
+                    }
+                } else {
+                    Ok(Value::Nil)
+                }
+            }
+            (Value::String(s), "squish!", _) => {
+                let re = Regex::new(r"\s+").unwrap();
+                let squished = re.replace_all(s.trim(), " ").to_string();
+                if squished == s {
+                    Ok(Value::Nil)
+                } else {
+                    Ok(Value::String(squished))
+                }
+            }
+            (Value::String(s), "squish", _) => {
+                let re = Regex::new(r"\s+").unwrap();
+                let squished = re.replace_all(s.trim(), " ").to_string();
+                Ok(Value::String(squished))
+            }
+            (Value::String(s), "chomp", _) => {
+                let suffix = args.get(0).and_then(|v| v.as_str()).unwrap_or("\n");
+                Ok(Value::String(
+                    s.strip_suffix(suffix).unwrap_or(&s).to_string(),
+                ))
+            }
+            (Value::String(s), "template", _) => {
+                let mut result = s.clone();
+                if let Some(Value::Hash(h)) = args.first() {
+                    let hash = h.read().unwrap();
+                    // Basic implementation for {{key}} and {{nested.key}}
+                    let re = Regex::new(r"\{\{([a-zA-Z0-9_\.]+)\}\}").unwrap();
+
+                    let mut replaced = result.clone();
+                    for cap in re.captures_iter(&result) {
+                        let full_match = &cap[0];
+                        let key_path = &cap[1];
+
+                        let mut current_val = Value::Nil;
+                        let mut found = false;
+
+                        // Handle nested keys like user.name
+                        let parts: Vec<&str> = key_path.split('.').collect();
+                        if let Some(first_key) = parts.first() {
+                            if let Some(val) = hash.get(*first_key) {
+                                current_val = val.clone();
+                                found = true;
+                                for part in parts.iter().skip(1) {
+                                    let next_val = if let Value::Hash(ref inner_h) = current_val {
+                                        inner_h.read().unwrap().get(*part).cloned()
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(v) = next_val {
+                                        current_val = v;
+                                    } else {
+                                        found = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if found && !current_val.is_nil() {
+                            replaced = replaced.replace(full_match, &current_val.to_string());
+                        }
+                    }
+                    result = replaced;
+                }
+                Ok(Value::String(result))
+            }
 
             (Value::Array(a), "push", _) => {
                 let mut arr = a.write().unwrap();
@@ -1018,6 +1518,112 @@ impl Engine {
                 let arr: Vec<Value> = (start..=end).map(Value::Int).collect();
                 Ok(Value::new_array(arr))
             }
+
+            (
+                Value::Money {
+                    cents: l,
+                    currency: cl,
+                },
+                BinaryOp::Add,
+                Value::Money {
+                    cents: r,
+                    currency: cr,
+                },
+            ) => {
+                if cl != cr {
+                    return Err(format!("Currency mismatch: {} vs {}", cl, cr));
+                }
+                Ok(Value::Money {
+                    cents: l + r,
+                    currency: cl,
+                })
+            }
+            (
+                Value::Money {
+                    cents: l,
+                    currency: cl,
+                },
+                BinaryOp::Sub,
+                Value::Money {
+                    cents: r,
+                    currency: cr,
+                },
+            ) => {
+                if cl != cr {
+                    return Err(format!("Currency mismatch: {} vs {}", cl, cr));
+                }
+                Ok(Value::Money {
+                    cents: l - r,
+                    currency: cl,
+                })
+            }
+            (
+                Value::Money {
+                    cents: l,
+                    currency: cl,
+                },
+                BinaryOp::Lt,
+                Value::Money {
+                    cents: r,
+                    currency: cr,
+                },
+            ) => {
+                if cl != cr {
+                    return Err(format!("Currency mismatch: {} vs {}", cl, cr));
+                }
+                Ok(Value::Bool(l < r))
+            }
+            (
+                Value::Money {
+                    cents: l,
+                    currency: cl,
+                },
+                BinaryOp::LtEq,
+                Value::Money {
+                    cents: r,
+                    currency: cr,
+                },
+            ) => {
+                if cl != cr {
+                    return Err(format!("Currency mismatch: {} vs {}", cl, cr));
+                }
+                Ok(Value::Bool(l <= r))
+            }
+            (
+                Value::Money {
+                    cents: l,
+                    currency: cl,
+                },
+                BinaryOp::Gt,
+                Value::Money {
+                    cents: r,
+                    currency: cr,
+                },
+            ) => {
+                if cl != cr {
+                    return Err(format!("Currency mismatch: {} vs {}", cl, cr));
+                }
+                Ok(Value::Bool(l > r))
+            }
+            (
+                Value::Money {
+                    cents: l,
+                    currency: cl,
+                },
+                BinaryOp::GtEq,
+                Value::Money {
+                    cents: r,
+                    currency: cr,
+                },
+            ) => {
+                if cl != cr {
+                    return Err(format!("Currency mismatch: {} vs {}", cl, cr));
+                }
+                Ok(Value::Bool(l >= r))
+            }
+
+            (Value::Duration(l), BinaryOp::Add, Value::Duration(r)) => Ok(Value::Duration(l + r)),
+            (Value::Duration(l), BinaryOp::Sub, Value::Duration(r)) => Ok(Value::Duration(l - r)),
 
             _ => Err("Binary operation not supported".to_string()),
         }

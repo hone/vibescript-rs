@@ -25,6 +25,7 @@ pub enum Expr {
         receiver: Box<Expr>,
         method: String,
         args: Vec<Expr>,
+        kwargs: Vec<(String, Expr)>,
         block: Option<Box<Expr>>,
     },
     Array(Vec<Expr>),
@@ -128,6 +129,10 @@ pub enum Stmt {
         kind: PropertyKind,
     },
     Return(Option<Expr>),
+    Assert {
+        condition: Expr,
+        message: Option<Expr>,
+    },
     Try {
         body: Vec<Stmt>,
         rescue: Option<RescueClause>,
