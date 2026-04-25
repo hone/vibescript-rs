@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::value::{ClassDef, FunctionDef, InstanceData, Param, Value};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use rand::{Rng, distributions::Alphanumeric};
 use regex::Regex;
 use std::collections::HashMap;
@@ -496,6 +496,29 @@ impl Engine {
                 }
                 Ok(Value::String(result))
             }
+            Expr::If {
+                condition,
+                then_branch,
+                elsif_branches,
+                else_branch,
+            } => {
+                let cond = self.eval_expr(condition)?;
+                if self.is_truthy(&cond) {
+                    self.eval_block(then_branch).map(|cf| cf.value())
+                } else {
+                    for (elsif_cond, elsif_body) in elsif_branches {
+                        let cond = self.eval_expr(elsif_cond)?;
+                        if self.is_truthy(&cond) {
+                            return self.eval_block(elsif_body).map(|cf| cf.value());
+                        }
+                    }
+                    if let Some(else_body) = else_branch {
+                        self.eval_block(else_body).map(|cf| cf.value())
+                    } else {
+                        Ok(Value::Nil)
+                    }
+                }
+            }
         }
     }
 
@@ -682,8 +705,17 @@ impl Engine {
                                 DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S %z")
                                     .map(|dt| dt.with_timezone(&Utc))
                             })
-                            .or_else(|_| Utc.datetime_from_str(s, "%Y-%m-%d %H:%M:%S"))
-                            .or_else(|_| Utc.datetime_from_str(s, "%Y-%m-%d"))
+                            .or_else(|_| {
+                                NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                                    .map(|ndt| ndt.and_utc())
+                            })
+                            .or_else(|_| {
+                                NaiveDateTime::parse_from_str(s, "%Y-%m-%d").map(|ndt| {
+                                    ndt.and_local_timezone(Utc)
+                                        .latest()
+                                        .unwrap_or_else(|| ndt.and_utc())
+                                })
+                            })
                             .map_err(|e| EvalError::Message(format!("Time parse error: {}", e)))?;
                         return Ok(Value::Time(t));
                     }
@@ -1456,7 +1488,8 @@ impl Engine {
                     Ok(arr[idx as usize].clone())
                 }
             }
-            (Value::Hash(h), BinaryOp::Index, Value::String(s)) => {
+            (Value::Hash(h), BinaryOp::Index, Value::String(s))
+            | (Value::Hash(h), BinaryOp::Index, Value::Symbol(s)) => {
                 let hash = h.read().unwrap();
                 Ok(hash.get(&s).cloned().unwrap_or(Value::Nil))
             }

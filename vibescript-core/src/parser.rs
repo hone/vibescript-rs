@@ -34,6 +34,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             just(Token::True).to("true".to_string()),
             just(Token::False).to("false".to_string()),
             just(Token::Nil).to("nil".to_string()),
+            just(Token::Then).to("then".to_string()),
             just(Token::Case).to("case".to_string()),
             just(Token::When).to("when".to_string()),
             just(Token::Begin).to("begin".to_string()),
@@ -77,36 +78,31 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             .boxed();
 
         let expr = recursive(|expr| {
-            let string_parser = select! {
-                Token::String(s) => s,
-            }
-            .map(|s| {
-                if s.contains("#{") {
-                    let mut parts = Vec::new();
-                    let mut last = 0;
-                    while let Some(start) = s[last..].find("#{") {
-                        let actual_start = last + start;
-                        if actual_start > last {
-                            parts.push(StringPart::Text(s[last..actual_start].to_string()));
-                        }
-                        if let Some(end) = s[actual_start..].find('}') {
-                            let actual_end = actual_start + end;
-                            let inner = &s[actual_start + 2..actual_end];
-                            parts.push(StringPart::Text(format!("#{{{}}}", inner)));
-                            last = actual_end + 1;
-                        } else {
-                            break;
+            let string_parser = just(Token::StringStart)
+                .ignore_then(
+                    choice((
+                        select! { Token::StringText(s) => StringPart::Text(s) },
+                        just(Token::InterpolationStart)
+                            .ignore_then(expr.clone())
+                            .then_ignore(just(Token::InterpolationEnd))
+                            .map(StringPart::Expr),
+                    ))
+                    .repeated()
+                    .collect::<Vec<_>>(),
+                )
+                .then_ignore(just(Token::StringEnd))
+                .map(|parts| {
+                    if parts.len() == 1 {
+                        if let StringPart::Text(s) = &parts[0] {
+                            return Expr::Literal(Value::String(s.clone()));
                         }
                     }
-                    if last < s.len() {
-                        parts.push(StringPart::Text(s[last..].to_string()));
+                    if parts.is_empty() {
+                        return Expr::Literal(Value::String(String::new()));
                     }
                     Expr::InterpolatedString(parts)
-                } else {
-                    Expr::Literal(Value::String(s))
-                }
-            })
-            .boxed();
+                })
+                .boxed();
 
             let literal = select! {
                 Token::Int(i) => Expr::Literal(Value::Int(i)),
@@ -137,7 +133,10 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
 
             let hash = member_name_parser
                 .clone()
-                .or(select! { Token::String(s) => s })
+                .or(just(Token::StringStart)
+                    .ignore_then(select! { Token::StringText(s) => s }.or_not())
+                    .then_ignore(just(Token::StringEnd))
+                    .map(|s| s.unwrap_or_default()))
                 .then_ignore(just(Token::Colon))
                 .then(expr.clone())
                 .separated_by(just(Token::Comma))
@@ -147,11 +146,63 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                 .map(Expr::Hash)
                 .boxed();
 
+            let if_expr = just(Token::If)
+                .ignore_then(expr.clone())
+                .then_ignore(just(Token::Then).or_not())
+                .then(block_body.clone())
+                .then(
+                    just(Token::Elsif)
+                        .ignore_then(expr.clone())
+                        .then_ignore(just(Token::Then).or_not())
+                        .then(block_body.clone())
+                        .repeated()
+                        .collect::<Vec<_>>(),
+                )
+                .then(just(Token::Else).ignore_then(block_body.clone()).or_not())
+                .then_ignore(just(Token::End))
+                .map(
+                    |(((condition, then_branch), elsif_branches), else_branch)| Expr::If {
+                        condition: Box::new(condition),
+                        then_branch,
+                        elsif_branches,
+                        else_branch,
+                    },
+                )
+                .boxed();
+
+            let case_expr = just(Token::Case)
+                .ignore_then(expr.clone().or_not())
+                .then(
+                    just(Token::When)
+                        .ignore_then(
+                            expr.clone()
+                                .separated_by(just(Token::Comma))
+                                .collect::<Vec<_>>(),
+                        )
+                        .then(block_body.clone())
+                        .map(|(values, body)| CaseClause { values, body })
+                        .repeated()
+                        .collect::<Vec<_>>(),
+                )
+                .then(just(Token::Else).ignore_then(block_body.clone()).or_not())
+                .then_ignore(just(Token::End))
+                .map(|((target, clauses), else_expr)| {
+                    let target = target as Option<Expr>;
+                    Expr::Case {
+                        target: Box::new(target.unwrap_or(Expr::Literal(Value::Bool(true)))),
+                        clauses,
+                        else_expr,
+                    }
+                })
+                .boxed();
+
             let atom = choice((
                 literal,
                 variable,
                 array,
                 hash,
+                if_expr,
+                case_expr,
                 block_lit.clone(),
                 expr.clone()
                     .delimited_by(just(Token::LParen), just(Token::RParen)),
@@ -360,42 +411,17 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                 )
                 .boxed();
 
-            let case_expr = just(Token::Case)
-                .ignore_then(logical_or.clone().or_not())
-                .then(
-                    just(Token::When)
-                        .ignore_then(
-                            logical_or
-                                .clone()
-                                .separated_by(just(Token::Comma))
-                                .collect::<Vec<_>>(),
-                        )
-                        .then(block_body.clone())
-                        .map(|(values, body)| CaseClause { values, body })
-                        .repeated()
-                        .collect::<Vec<_>>(),
-                )
-                .then(just(Token::Else).ignore_then(block_body.clone()).or_not())
-                .then_ignore(just(Token::End))
-                .map(|((target, clauses), else_expr)| {
-                    let target = target as Option<Expr>;
-                    Expr::Case {
-                        target: Box::new(target.unwrap_or(Expr::Literal(Value::Bool(true)))),
-                        clauses,
-                        else_expr,
-                    }
-                })
-                .boxed();
-
-            case_expr.or(logical_or).boxed()
+            logical_or.boxed()
         });
 
         let if_stmt = just(Token::If)
             .ignore_then(expr.clone())
+            .then_ignore(just(Token::Then).or_not())
             .then(block_body.clone())
             .then(
                 just(Token::Elsif)
                     .ignore_then(expr.clone())
+                    .then_ignore(just(Token::Then).or_not())
                     .then(block_body.clone())
                     .repeated()
                     .collect::<Vec<_>>(),

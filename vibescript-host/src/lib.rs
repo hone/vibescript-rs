@@ -20,7 +20,6 @@ impl VibesHost {
     pub fn new() -> anyhow::Result<VibesHost> {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
-        config.async_support(true);
 
         let engine = Engine::new(&config)?;
         let mut linker = Linker::new(&engine);

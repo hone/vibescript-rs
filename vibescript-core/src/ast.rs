@@ -40,6 +40,12 @@ pub enum Expr {
         body: Vec<Stmt>,
     },
     InterpolatedString(Vec<StringPart>),
+    If {
+        condition: Box<Expr>,
+        then_branch: Vec<Stmt>,
+        elsif_branches: Vec<(Expr, Vec<Stmt>)>,
+        else_branch: Option<Vec<Stmt>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

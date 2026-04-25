@@ -8,7 +8,6 @@ pub mod value;
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use chumsky::prelude::*;
-use logos::Logos;
 
 // Generate the WASM Component bindings - only when targeting WASM
 #[cfg(target_arch = "wasm32")]
@@ -172,14 +171,8 @@ fn vibe_to_wit(engine: &eval::Engine, v: value::Value) -> WitValue {
 }
 
 fn lex_with_spans(source: &str) -> (Vec<lexer::Token>, Vec<SimpleSpan>) {
-    let mut tokens = Vec::new();
-    let mut spans = Vec::new();
-
-    for (token, span) in lexer::Token::lexer(source).spanned() {
-        tokens.push(token.unwrap_or(lexer::Token::Nil));
-        spans.push(span.into());
-    }
-
+    let (tokens, ranges) = lexer::lex_with_spans(source);
+    let spans = ranges.into_iter().map(SimpleSpan::from).collect();
     (tokens, spans)
 }
 
@@ -561,7 +554,7 @@ mod tests {
     fn test_interpolation() {
         let source = "name = \"Gwen\"\n\"Hello #{name}!\"";
         let result = execute(source).unwrap();
-        assert!(result.to_string().contains("name"));
+        assert_eq!(result.to_string(), "Hello Gwen!");
     }
 
     #[test]
