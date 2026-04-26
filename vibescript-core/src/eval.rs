@@ -7,13 +7,31 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
+pub trait ModuleResolver: Send + Sync {
+    fn load_module(
+        &self,
+        name: &str,
+        caller_path: Option<&str>,
+    ) -> Result<(String, String), String>;
+}
+
+pub trait Compiler: Send + Sync {
+    fn compile(&self, source: &str) -> Result<Vec<Stmt>, String>;
+}
+
 pub struct Engine {
     globals: HashMap<String, Value>,
     stack: Vec<HashMap<String, Value>>,
     pub functions: HashMap<String, FunctionDef>,
     pub classes: HashMap<String, Arc<ClassDef>>,
+    pub enums: HashMap<String, Stmt>, // Store Stmt::EnumDef variants
     class_vars: HashMap<String, Value>,
     recursion_depth: usize,
+    pub modules: HashMap<String, Value>,
+    pub loading_modules: Vec<String>,
+    pub module_resolver: Option<Arc<dyn ModuleResolver>>,
+    pub compiler: Option<Arc<dyn Compiler>>,
+    pub current_module_path: Option<String>,
 }
 
 const MAX_RECURSION_DEPTH: usize = 500;
@@ -64,9 +82,121 @@ impl Engine {
             stack: vec![HashMap::new()],
             functions: HashMap::new(),
             classes: HashMap::new(),
+            enums: HashMap::new(),
             class_vars: HashMap::new(),
             recursion_depth: 0,
+            modules: HashMap::new(),
+            loading_modules: Vec::new(),
+            module_resolver: None,
+            compiler: None,
+            current_module_path: None,
         }
+    }
+
+    pub fn eval_script(&mut self, stmts: &[Stmt]) -> Result<Value, EvalError> {
+        let mut last_val = Value::Nil;
+        for stmt in stmts {
+            match self.eval_stmt(stmt)? {
+                ControlFlow::Continue(v) => last_val = v,
+                ControlFlow::Return(v) => return Ok(v),
+                ControlFlow::Break(v) => return Ok(v),
+                ControlFlow::Next(v) => last_val = v,
+            }
+        }
+        Ok(last_val)
+    }
+
+    fn builtin_require(
+        &mut self,
+        name: &str,
+        kwargs: &Option<HashMap<String, Value>>,
+    ) -> Result<Value, EvalError> {
+        let resolver = self
+            .module_resolver
+            .clone()
+            .ok_or_else(|| EvalError::Message("Module resolver not configured".to_string()))?;
+        let compiler = self
+            .compiler
+            .clone()
+            .ok_or_else(|| EvalError::Message("Compiler not configured".to_string()))?;
+
+        let (source, resolved_path) = resolver
+            .load_module(name, self.current_module_path.as_deref())
+            .map_err(EvalError::Message)?;
+
+        if let Some(cached) = self.modules.get(&resolved_path) {
+            return Ok(cached.clone());
+        }
+
+        if self.loading_modules.contains(&resolved_path) {
+            return Err(EvalError::Message(format!(
+                "Circular dependency detected: {}",
+                resolved_path
+            )));
+        }
+
+        self.loading_modules.push(resolved_path.clone());
+
+        let stmts = compiler.compile(&source).map_err(EvalError::Message)?;
+
+        let mut mod_engine = Engine::new();
+        mod_engine.module_resolver = self.module_resolver.clone();
+        mod_engine.compiler = self.compiler.clone();
+        mod_engine.current_module_path = Some(resolved_path.clone());
+        mod_engine.modules = self.modules.clone();
+        mod_engine.loading_modules = self.loading_modules.clone();
+
+        mod_engine.eval_script(&stmts)?;
+
+        // Sync module cache back
+        for (k, v) in &mod_engine.modules {
+            self.modules.insert(k.clone(), v.clone());
+        }
+
+        // Extract exports: Enums and non-private functions
+        let exports = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut exports_map = exports.write().unwrap();
+
+            // 1. Enums
+            for name in mod_engine.enums.keys() {
+                let enum_val = Value::Namespace(name.clone()); // Simplified for now
+                exports_map.insert(name.clone(), enum_val.clone());
+                // Inject globally if not exists
+                if !self.globals.contains_key(name) {
+                    self.globals.insert(name.clone(), enum_val);
+                }
+            }
+
+            // 2. Functions (non-private)
+            for (name, func) in &mod_engine.functions {
+                if !func.is_private {
+                    let fn_val = Value::Function(Arc::new(func.clone()));
+                    exports_map.insert(name.clone(), fn_val.clone());
+
+                    // Inject globally if not exists
+                    if !self.globals.contains_key(name) {
+                        self.globals.insert(name.clone(), fn_val);
+                    }
+                }
+            }
+        }
+
+        let exports_val = Value::Object(exports);
+        self.modules
+            .insert(resolved_path.clone(), exports_val.clone());
+        self.loading_modules.pop();
+
+        // Handle alias if 'as' kwarg is provided
+        if let Some(kwargs) = kwargs {
+            if let Some(Value::String(alias)) = kwargs.get("as") {
+                self.globals.insert(alias.clone(), exports_val.clone());
+            } else if let Some(Value::Symbol(alias)) = kwargs.get("as") {
+                self.globals.insert(alias.clone(), exports_val.clone());
+            }
+        }
+
+        Ok(exports_val)
     }
 
     pub fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ControlFlow, EvalError> {
@@ -183,6 +313,7 @@ impl Engine {
                 Ok(ControlFlow::Continue(Value::Nil))
             }
             Stmt::EnumDef { name, members } => {
+                self.enums.insert(name.clone(), stmt.clone());
                 let mut variants = HashMap::new();
                 for m in members {
                     variants.insert(
@@ -405,7 +536,22 @@ impl Engine {
                             .collect();
                         return Ok(Value::String(s));
                     }
+                    "require" => {
+                        if let Some(Value::String(name)) = arg_vals.first() {
+                            return self.builtin_require(name, &Some(kwarg_vals));
+                        } else {
+                            return Err(EvalError::Message(
+                                "require expects a string argument".to_string(),
+                            ));
+                        }
+                    }
                     _ => {}
+                }
+
+                if let Some(val) = self.get_var(func) {
+                    if let Value::Function(f) = val {
+                        return self.call_function_def(&f, arg_vals, block.as_deref());
+                    }
                 }
 
                 if let Some(f) = self.functions.get(func).cloned() {
@@ -761,63 +907,210 @@ impl Engine {
 
         // High priority: Standard methods
         match (receiver.clone(), method, block) {
-            (Value::Array(a), "length" | "size", _) => {
-                return Ok(Value::Int(a.read().unwrap().len() as i64));
-            }
-            (Value::Array(a), "first", _) => {
-                let arr = a.read().unwrap();
-                if let Some(Value::Int(n)) = args.first() {
-                    let count = (*n).max(0) as usize;
-                    let taken = arr.iter().take(count).cloned().collect();
-                    return Ok(Value::new_array(taken));
+            (Value::Object(o), method, _) => {
+                let obj = o.read().unwrap();
+                if let Some(val) = obj.get(method).cloned() {
+                    if let Value::Function(f) = val {
+                        return self
+                            .call_function_def_cf(&f, args, block)
+                            .map(|cf| cf.value());
+                    }
+                    return Ok(val);
                 } else {
+                    return Err(EvalError::Message(format!(
+                        "Member '{}' not found in Object",
+                        method
+                    )));
+                }
+            }
+            (Value::Hash(h), method, _) => {
+                let hash = h.read().unwrap();
+                if let Some(val) = hash.get(method).cloned() {
+                    if let Value::Function(f) = val {
+                        return self
+                            .call_function_def_cf(&f, args, block)
+                            .map(|cf| cf.value());
+                    }
+                    return Ok(val);
+                } else if method == "length" || method == "size" {
+                    return Ok(Value::Int(hash.len() as i64));
+                } else if method == "fetch" {
+                    if let Some(Value::String(key)) = args.first() {
+                        if let Some(val) = hash.get(key) {
+                            return Ok(val.clone());
+                        }
+                        if args.len() == 2 {
+                            return Ok(args[1].clone());
+                        }
+                        return Ok(Value::Nil);
+                    } else if let Some(Value::Symbol(key)) = args.first() {
+                        if let Some(val) = hash.get(key) {
+                            return Ok(val.clone());
+                        }
+                        if args.len() == 2 {
+                            return Ok(args[1].clone());
+                        }
+                        return Ok(Value::Nil);
+                    }
+                    return Err(EvalError::Message(
+                        "Hash.fetch expects a string or symbol key".to_string(),
+                    ));
+                } else if method == "keys" {
+                    let keys = hash.keys().map(|k| Value::String(k.clone())).collect();
+                    return Ok(Value::new_array(keys));
+                } else if method == "values" {
+                    let values = hash.values().cloned().collect();
+                    return Ok(Value::new_array(values));
+                } else if method == "merge" {
+                    if let Some(other_val) = args.first() {
+                        if let Some(other_hash_lock) = other_val.as_hash() {
+                            let other_hash = other_hash_lock.read().unwrap();
+                            let mut new_map = (*hash).clone();
+                            for (k, v) in other_hash.iter() {
+                                new_map.insert(k.clone(), v.clone());
+                            }
+                            return Ok(Value::new_hash(new_map));
+                        }
+                    }
+                    return Err(EvalError::Message(
+                        "Hash.merge expects another Hash argument".to_string(),
+                    ));
+                } else {
+                    return Err(EvalError::Message(format!(
+                        "Method '{}' not supported for Hash and key not found",
+                        method
+                    )));
+                }
+            }
+            (Value::Array(a), method, _) => {
+                if method == "length" || method == "size" {
+                    return Ok(Value::Int(a.read().unwrap().len() as i64));
+                } else if method == "fetch" {
+                    let arr = a.read().unwrap();
+                    if let Some(idx) = args.first().and_then(|v| v.as_int()) {
+                        let i = idx as usize;
+                        if i < arr.len() {
+                            return Ok(arr[i].clone());
+                        }
+                        if args.len() == 2 {
+                            return Ok(args[1].clone());
+                        }
+                        return Ok(Value::Nil);
+                    }
+                    return Err(EvalError::Message(
+                        "Array.fetch expects an integer index".to_string(),
+                    ));
+                } else if method == "first" {
+                    let arr = a.read().unwrap();
+                    if let Some(count_val) = args.first() {
+                        if let Some(count) = count_val.as_int() {
+                            let n = count as usize;
+                            let sub: Vec<Value> = arr.iter().take(n).cloned().collect();
+                            return Ok(Value::new_array(sub));
+                        }
+                    }
                     return Ok(arr.first().cloned().unwrap_or(Value::Nil));
-                }
-            }
-            (Value::Array(a), "sum", _) => {
-                let arr = a.read().unwrap();
-                let mut total = 0;
-                for val in arr.iter() {
-                    if let Value::Int(i) = val {
-                        total += i;
+                } else if method == "last" {
+                    let arr = a.read().unwrap();
+                    if let Some(count_val) = args.first() {
+                        if let Some(count) = count_val.as_int() {
+                            let n = count as usize;
+                            let start = if arr.len() > n { arr.len() - n } else { 0 };
+                            let sub: Vec<Value> = arr.iter().skip(start).cloned().collect();
+                            return Ok(Value::new_array(sub));
+                        }
                     }
-                }
-                return Ok(Value::Int(total));
-            }
-            (Value::String(s), "length" | "size", _) => return Ok(Value::Int(s.len() as i64)),
-            (Value::Hash(h), "length" | "size", _) => {
-                return Ok(Value::Int(h.read().unwrap().len() as i64));
-            }
-            (Value::Hash(h), "keys", _) => {
-                let hash = h.read().unwrap();
-                let keys = hash.keys().map(|k| Value::String(k.clone())).collect();
-                return Ok(Value::new_array(keys));
-            }
-            (Value::Hash(h), "values", _) => {
-                let hash = h.read().unwrap();
-                let values = hash.values().cloned().collect();
-                return Ok(Value::new_array(values));
-            }
-            (Value::Hash(h), "fetch", _) => {
-                let hash = h.read().unwrap();
-                if let Some(Value::String(key)) = args.first() {
-                    if let Some(val) = hash.get(key).cloned() {
-                        return Ok(val);
+                    return Ok(arr.last().cloned().unwrap_or(Value::Nil));
+                } else if method == "reverse" {
+                    let arr = a.read().unwrap();
+                    let rev: Vec<Value> = arr.iter().rev().cloned().collect();
+                    return Ok(Value::new_array(rev));
+                } else if method == "join" {
+                    let arr = a.read().unwrap();
+                    let sep = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                    let joined = arr
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<String>>()
+                        .join(sep);
+                    return Ok(Value::String(joined));
+                } else if method == "empty?" {
+                    return Ok(Value::Bool(a.read().unwrap().is_empty()));
+                } else if method == "include?" || method == "contains?" {
+                    if let Some(target) = args.first() {
+                        return Ok(Value::Bool(a.read().unwrap().contains(target)));
                     }
-                    if let Some(default) = args.get(1) {
-                        return Ok(default.clone());
+                    return Ok(Value::Bool(false));
+                } else if method == "push" {
+                    let mut arr = a.write().unwrap();
+                    for arg in args {
+                        arr.push(arg.clone());
                     }
-                    return Err(EvalError::Message(format!("Key '{}' not found", key)));
-                }
-                return Err(EvalError::Message("fetch expects a key".to_string()));
-            }
-            (Value::Hash(h), "merge", _) => {
-                if let Some(Value::Hash(other_h)) = args.first() {
-                    let hash = h.read().unwrap();
-                    let other_hash = other_h.read().unwrap();
-                    let mut new_hash = hash.clone();
-                    new_hash.extend(other_hash.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    return Ok(Value::new_hash(new_hash));
+                    return Ok(Value::Array(a.clone()));
+                } else if method == "pop" {
+                    return Ok(a.write().unwrap().pop().unwrap_or(Value::Nil));
+                } else if method == "sum" {
+                    let arr = a.read().unwrap();
+                    let mut sum_int = 0;
+                    let mut sum_float = 0.0;
+                    let mut has_float = false;
+                    for v in arr.iter() {
+                        if let Some(i) = v.as_int() {
+                            sum_int += i;
+                            sum_float += i as f64;
+                        } else if let Some(f) = v.as_float() {
+                            sum_float += f;
+                            has_float = true;
+                        }
+                    }
+                    if has_float {
+                        return Ok(Value::Float(sum_float));
+                    } else {
+                        return Ok(Value::Int(sum_int));
+                    }
+                } else if method == "compact" {
+                    let arr = a.read().unwrap();
+                    let compacted: Vec<Value> = arr
+                        .iter()
+                        .filter(|v| !matches!(v, Value::Nil))
+                        .cloned()
+                        .collect();
+                    return Ok(Value::new_array(compacted));
+                } else if method == "uniq" {
+                    let arr = a.read().unwrap();
+                    let mut unique: Vec<Value> = Vec::new();
+                    for v in arr.iter() {
+                        if !unique.contains(v) {
+                            unique.push(v.clone());
+                        }
+                    }
+                    return Ok(Value::new_array(unique));
+                } else if method == "[]=" {
+                    if args.len() < 2 {
+                        return Err(EvalError::Message(
+                            "[]= expects an index and a value".to_string(),
+                        ));
+                    }
+                    let idx_val = &args[0];
+                    let new_val = &args[1];
+                    if let Some(idx) = idx_val.as_int() {
+                        let mut arr = a.write().unwrap();
+                        let i = idx as usize;
+                        if i < arr.len() {
+                            arr[i] = new_val.clone();
+                            return Ok(new_val.clone());
+                        } else {
+                            return Err(EvalError::Message(format!(
+                                "Index {} out of bounds for array of length {}",
+                                i,
+                                arr.len()
+                            )));
+                        }
+                    } else {
+                        return Err(EvalError::Message(
+                            "Array index must be an integer".to_string(),
+                        ));
+                    }
                 }
             }
             _ => {}
@@ -887,7 +1180,38 @@ impl Engine {
                 Ok(Value::String(t.to_rfc3339()))
             }
 
-            (Value::Duration(s), "seconds", _) => Ok(Value::Int(s)),
+            (Value::Duration(s), method, _) => {
+                if method == "seconds" || method == "to_i" {
+                    return Ok(Value::Int(s));
+                } else if method == "iso8601" {
+                    let h = s / 3600;
+                    let m = (s % 3600) / 60;
+                    let sec = s % 60;
+                    let mut res = "PT".to_string();
+                    if h > 0 {
+                        res.push_str(&format!("{}H", h));
+                    }
+                    if m > 0 {
+                        res.push_str(&format!("{}M", m));
+                    }
+                    if sec > 0 || (h == 0 && m == 0) {
+                        res.push_str(&format!("{}S", sec));
+                    }
+                    return Ok(Value::String(res));
+                } else if method == "in_hours" {
+                    return Ok(Value::Float(s as f64 / 3600.0));
+                } else if method == "parts" {
+                    let mut parts = HashMap::new();
+                    parts.insert("hours".to_string(), Value::Int(s / 3600));
+                    parts.insert("minutes".to_string(), Value::Int((s % 3600) / 60));
+                    parts.insert("seconds".to_string(), Value::Int(s % 60));
+                    return Ok(Value::new_hash(parts));
+                }
+                Err(EvalError::Message(format!(
+                    "Method '{}' not supported for Duration",
+                    method
+                )))
+            }
 
             (Value::Int(i), "minutes", _) => Ok(Value::Duration(i * 60)),
             (Value::Int(i), "hours", _) => Ok(Value::Duration(i * 3600)),
@@ -916,20 +1240,9 @@ impl Engine {
                 }
             }
 
-            (Value::Hash(h), method, _) => {
-                let hash = h.read().unwrap();
-                if let Some(val) = hash.get(method).cloned() {
-                    Ok(val)
-                } else {
-                    Err(EvalError::Message(format!(
-                        "Method '{}' not found for Hash",
-                        method
-                    )))
-                }
-            }
-
             (_, "to_string", _) => Ok(Value::String(receiver.to_string())),
 
+            (Value::String(s), "length" | "size", _) => Ok(Value::Int(s.chars().count() as i64)),
             (Value::String(s), "uppercase" | "upcase", _) => Ok(Value::String(s.to_uppercase())),
             (Value::String(s), "lowercase" | "downcase", _) => Ok(Value::String(s.to_lowercase())),
             (Value::String(s), "capitalize", _) => {
@@ -1383,6 +1696,54 @@ impl Engine {
                 Ok(Value::Array(a))
             }
 
+            (Value::Hash(h), "keys", _) => {
+                let hash = h.read().unwrap();
+                let mut keys: Vec<Value> = hash.keys().map(|k| Value::String(k.clone())).collect();
+                keys.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+                Ok(Value::new_array(keys))
+            }
+            (Value::Hash(h), "values", _) => {
+                let hash = h.read().unwrap();
+                let values: Vec<Value> = hash.values().cloned().collect();
+                Ok(Value::new_array(values))
+            }
+            (Value::Hash(h), "length" | "size", _) => {
+                let hash = h.read().unwrap();
+                Ok(Value::Int(hash.len() as i64))
+            }
+            (Value::Hash(h), "merge", _) => {
+                if let Some(Value::Hash(other)) = args.first() {
+                    let h1 = h.read().unwrap();
+                    let h2 = other.read().unwrap();
+                    let mut new_hash = h1.clone();
+                    for (k, v) in h2.iter() {
+                        new_hash.insert(k.clone(), v.clone());
+                    }
+                    Ok(Value::new_hash(new_hash))
+                } else {
+                    Err(EvalError::Message("merge expects a hash".to_string()))
+                }
+            }
+            (Value::Hash(h), method, _) => {
+                let val = {
+                    let hash = h.read().unwrap();
+                    hash.get(method).cloned()
+                };
+                if let Some(val) = val {
+                    if let Value::Function(f) = val {
+                        return self.call_function_def(&f, args, block);
+                    }
+                    Ok(val)
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Method '{}' not supported for Hash and key not found",
+                        method
+                    )))
+                }
+            }
+
+            (Value::Function(f), "call", _) => self.call_function_def(&f, args, block),
+
             _ => Err(EvalError::Message(format!(
                 "Method '{}' not supported for this type",
                 method
@@ -1506,18 +1867,22 @@ impl Engine {
                 if r == 0 {
                     return Err("Division by zero".to_string());
                 }
-                let res = if (l < 0) != (r < 0) && l % r != 0 {
-                    (l / r) - 1
-                } else {
-                    l / r
-                };
-                Ok(Value::Int(res))
+                let mut quotient = l / r;
+                let remainder = l % r;
+                if remainder != 0 && ((remainder < 0) != (r < 0)) {
+                    quotient -= 1;
+                }
+                Ok(Value::Int(quotient))
             }
             (Value::Int(l), BinaryOp::Modulo, Value::Int(r)) => {
                 if r == 0 {
                     return Err("Modulo by zero".to_string());
                 }
-                Ok(Value::Int(l % r))
+                let mut remainder = l % r;
+                if remainder != 0 && ((remainder < 0) != (r < 0)) {
+                    remainder += r;
+                }
+                Ok(Value::Int(remainder))
             }
             (Value::Float(l), BinaryOp::Add, Value::Float(r)) => Ok(Value::Float(l + r)),
             (Value::Float(l), BinaryOp::Add, Value::Int(r)) => Ok(Value::Float(l + r as f64)),
@@ -1546,6 +1911,25 @@ impl Engine {
                 new_arr.extend(r.iter().cloned());
                 Ok(Value::new_array(new_arr))
             }
+
+            (Value::Time(t), BinaryOp::Add, Value::Duration(s)) => {
+                let d = chrono::Duration::seconds(s);
+                Ok(Value::Time(t + d))
+            }
+            (Value::Duration(s), BinaryOp::Add, Value::Time(t)) => {
+                let d = chrono::Duration::seconds(s);
+                Ok(Value::Time(t + d))
+            }
+            (Value::Duration(l), BinaryOp::Add, Value::Duration(r)) => Ok(Value::Duration(l + r)),
+            (Value::Time(l), BinaryOp::Sub, Value::Time(r)) => {
+                let diff = l - r;
+                Ok(Value::Duration(diff.num_seconds()))
+            }
+            (Value::Time(t), BinaryOp::Sub, Value::Duration(s)) => {
+                let d = chrono::Duration::seconds(s);
+                Ok(Value::Time(t - d))
+            }
+            (Value::Duration(l), BinaryOp::Sub, Value::Duration(r)) => Ok(Value::Duration(l - r)),
 
             (Value::Int(start), BinaryOp::Range, Value::Int(end)) => {
                 let arr: Vec<Value> = (start..=end).map(Value::Int).collect();
@@ -1654,9 +2038,6 @@ impl Engine {
                 }
                 Ok(Value::Bool(l >= r))
             }
-
-            (Value::Duration(l), BinaryOp::Add, Value::Duration(r)) => Ok(Value::Duration(l + r)),
-            (Value::Duration(l), BinaryOp::Sub, Value::Duration(r)) => Ok(Value::Duration(l - r)),
 
             _ => Err("Binary operation not supported".to_string()),
         }

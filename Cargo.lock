@@ -2087,6 +2087,7 @@ name = "vibescript-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde_json",
  "tokio",
  "wasmtime",
  "wasmtime-wasi",

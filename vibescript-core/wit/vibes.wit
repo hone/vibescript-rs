@@ -30,6 +30,11 @@ interface engine-world {
     }
 }
 
-world vibes-provider {
+interface loader {
+    load-module: func(name: string, caller-path: option<string>) -> result<tuple<string, string>, string>;
+}
+
+world engine {
+    import loader;
     export engine-world;
 }

@@ -48,6 +48,7 @@ fn main() {
 
     // Watch for changes in the core crate
     println!("cargo:rerun-if-changed=../vibescript-core/src");
+    println!("cargo:rerun-if-changed=../vibescript-core/wit");
     println!("cargo:rerun-if-changed=../vibescript-core/Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
 }

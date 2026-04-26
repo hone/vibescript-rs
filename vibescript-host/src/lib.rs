@@ -1,17 +1,30 @@
-use wasmtime::{Engine, component::Linker};
+use std::sync::{Arc, RwLock};
+use wasmtime::{Engine as WasmEngine, component::Linker, component::ResourceTable};
+use wasmtime_wasi::WasiCtx;
 
 wasmtime::component::bindgen!({
-    world: "vibes-provider",
+    world: "engine",
     path: "wit",
     exports: {
         "xipkit:vibes/engine-world": async,
     },
 });
 
+pub struct HostState {
+    pub ctx: WasiCtx,
+    pub table: ResourceTable,
+    pub loader: HostModuleLoader,
+}
+
+pub struct HostModuleLoader {
+    pub search_paths: Arc<RwLock<Vec<std::path::PathBuf>>>,
+}
+
 pub struct VibesHost {
-    engine: Engine,
+    engine: WasmEngine,
     linker: Linker<HostState>,
     component: wasmtime::component::Component,
+    pub search_paths: Arc<RwLock<Vec<std::path::PathBuf>>>,
 }
 
 const VIBES_CORE_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vibescript_core.wasm"));
@@ -21,10 +34,12 @@ impl VibesHost {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
 
-        let engine = Engine::new(&config)?;
+        let engine = WasmEngine::new(&config)?;
         let mut linker = Linker::new(&engine);
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+
+        Engine::add_to_linker::<HostState, HostState>(&mut linker, |s| s)?;
 
         let component = wasmtime::component::Component::from_binary(&engine, VIBES_CORE_WASM)?;
 
@@ -32,10 +47,11 @@ impl VibesHost {
             engine,
             linker,
             component,
+            search_paths: Arc::new(RwLock::new(vec![std::env::current_dir()?])),
         })
     }
 
-    async fn setup_instance(&self) -> anyhow::Result<(wasmtime::Store<HostState>, VibesProvider)> {
+    async fn setup_instance(&self) -> anyhow::Result<(wasmtime::Store<HostState>, Engine)> {
         let wasi = wasmtime_wasi::WasiCtxBuilder::new()
             .inherit_stdout()
             .inherit_stderr()
@@ -45,12 +61,14 @@ impl VibesHost {
             &self.engine,
             HostState {
                 ctx: wasi,
-                table: wasmtime::component::ResourceTable::new(),
+                table: ResourceTable::new(),
+                loader: HostModuleLoader {
+                    search_paths: self.search_paths.clone(),
+                },
             },
         );
 
-        let instance =
-            VibesProvider::instantiate_async(&mut store, &self.component, &self.linker).await?;
+        let instance = Engine::instantiate_async(&mut store, &self.component, &self.linker).await?;
 
         Ok((store, instance))
     }
@@ -106,10 +124,26 @@ impl VibesHost {
             .await?
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // Convert string args to WitValue::S
+        // Convert string args to WitValue, trying to parse as numbers or JSON first
         let wit_args: Vec<exports::xipkit::vibes::engine_world::Value> = args
             .iter()
-            .map(|s| exports::xipkit::vibes::engine_world::Value::S(s.clone()))
+            .map(|s| {
+                if let Ok(i) = s.parse::<i64>() {
+                    exports::xipkit::vibes::engine_world::Value::I(i)
+                } else if let Ok(f) = s.parse::<f64>() {
+                    exports::xipkit::vibes::engine_world::Value::F(f)
+                } else if (s.starts_with('[') && s.ends_with(']'))
+                    || (s.starts_with('{') && s.ends_with('}'))
+                {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                        exports::xipkit::vibes::engine_world::Value::Json(v.to_string())
+                    } else {
+                        exports::xipkit::vibes::engine_world::Value::S(s.clone())
+                    }
+                } else {
+                    exports::xipkit::vibes::engine_world::Value::S(s.clone())
+                }
+            })
             .collect();
 
         // Execute script using the specified function name
@@ -123,9 +157,95 @@ impl VibesHost {
     }
 }
 
-pub struct HostState {
-    pub ctx: wasmtime_wasi::WasiCtx,
-    pub table: wasmtime_wasi::ResourceTable,
+impl HostModuleLoader {
+    fn load_module_impl(
+        &mut self,
+        name: String,
+        caller_path: Option<String>,
+    ) -> Result<(String, String), String> {
+        let mut name_with_ext = name.clone();
+        if !name_with_ext.ends_with(".vibe") {
+            name_with_ext.push_str(".vibe");
+        }
+
+        let mut resolved_path = None;
+
+        // 1. Check relative path if it's an explicit relative request
+        if name.starts_with("./") || name.starts_with("../") {
+            if let Some(caller) = caller_path {
+                if let Some(caller_dir) = std::path::Path::new(&caller).parent() {
+                    let candidate = caller_dir.join(&name_with_ext);
+                    if candidate.exists() {
+                        resolved_path = Some(candidate);
+                    }
+                }
+            }
+        }
+
+        // 2. Check search paths
+        if resolved_path.is_none() {
+            let paths = self.search_paths.read().unwrap();
+            for path in paths.iter() {
+                let candidate = path.join(&name_with_ext);
+                if candidate.exists() {
+                    resolved_path = Some(candidate);
+                    break;
+                }
+            }
+        }
+
+        match resolved_path {
+            Some(path) => {
+                let abs_path = match std::fs::canonicalize(&path) {
+                    Ok(p) => p,
+                    Err(e) => return Err(format!("Failed to resolve path: {}", e)),
+                };
+
+                // Security Sandbox: Ensure the canonical path starts with one of the search paths
+                let paths = self.search_paths.read().unwrap();
+                let mut allowed = false;
+                for search_path in paths.iter() {
+                    let canonical_search = match std::fs::canonicalize(search_path) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if abs_path.starts_with(&canonical_search) {
+                        allowed = true;
+                        break;
+                    }
+                }
+
+                if !allowed {
+                    return Err(format!(
+                        "Security error: Module path '{}' is outside of allowed search paths",
+                        abs_path.display()
+                    ));
+                }
+
+                let source = match std::fs::read_to_string(&abs_path) {
+                    Ok(s) => s,
+                    Err(e) => return Err(format!("Failed to read module: {}", e)),
+                };
+                Ok((source, abs_path.to_string_lossy().to_string()))
+            }
+            None => Err(format!("Module '{}' not found", name)),
+        }
+    }
+}
+
+impl xipkit::vibes::loader::Host for HostState {
+    fn load_module(
+        &mut self,
+        name: String,
+        caller_path: Option<String>,
+    ) -> Result<(String, String), String> {
+        self.loader.load_module_impl(name, caller_path)
+    }
+}
+
+// Map HostState to itself for HasData
+impl wasmtime::component::HasData for HostState {
+    type Data<'a> = &'a mut HostState;
 }
 
 impl wasmtime_wasi::WasiView for HostState {

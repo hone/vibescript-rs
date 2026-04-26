@@ -29,10 +29,12 @@ pub enum Value {
     },
     Array(Arc<RwLock<Vec<Value>>>),
     Hash(Arc<RwLock<HashMap<String, Value>>>),
+    Object(Arc<RwLock<HashMap<String, Value>>>),
     Block {
         params: Vec<String>,
         body: Vec<Stmt>,
     },
+    Function(Arc<FunctionDef>),
     Class(Arc<ClassDef>),
     Instance(Arc<RwLock<InstanceData>>),
     Builtin(String),
@@ -71,7 +73,12 @@ impl Serialize for Value {
                 let hash = h.read().unwrap();
                 serializer.collect_map(hash.iter())
             }
+            Value::Object(o) => {
+                let obj = o.read().unwrap();
+                serializer.collect_map(obj.iter())
+            }
             Value::Block { .. } => serializer.serialize_str("<block>"),
+            Value::Function(_) => serializer.serialize_str("<function>"),
             Value::Class(c) => serializer.serialize_str(&format!("<class {}>", c.name)),
             Value::Instance(i) => {
                 let inst = i.read().unwrap();
@@ -182,6 +189,18 @@ impl PartialEq for Value {
                     lv.iter().all(|(k, v)| rv.get(k) == Some(v))
                 }
             }
+            (Value::Object(l), Value::Object(r)) => {
+                if Arc::ptr_eq(l, r) {
+                    true
+                } else {
+                    let lv = l.read().unwrap();
+                    let rv = r.read().unwrap();
+                    if lv.len() != rv.len() {
+                        return false;
+                    }
+                    lv.iter().all(|(k, v)| rv.get(k) == Some(v))
+                }
+            }
             (Value::Class(l), Value::Class(r)) => Arc::ptr_eq(l, r),
             (Value::Instance(l), Value::Instance(r)) => Arc::ptr_eq(l, r),
             (Value::Builtin(l), Value::Builtin(r)) => l == r,
@@ -229,6 +248,20 @@ impl Value {
         }
     }
 
+    pub fn as_hash(&self) -> Option<Arc<RwLock<HashMap<String, Value>>>> {
+        match self {
+            Value::Hash(h) => Some(h.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<Arc<RwLock<Vec<Value>>>> {
+        match self {
+            Value::Array(a) => Some(a.clone()),
+            _ => None,
+        }
+    }
+
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Nil => false,
@@ -265,10 +298,20 @@ impl Value {
                     .iter()
                     .map(|(k, v)| format!("{}: {}", k, v.to_string()))
                     .collect();
-                parts.sort(); // Consistent output
-                format!("{{{}}}", parts.join(", "))
+                parts.sort();
+                format!("{{ {} }}", parts.join(", "))
             }
-            Value::Block { .. } => "block".to_string(),
+            Value::Object(o) => {
+                let obj = o.read().unwrap();
+                let mut parts: Vec<String> = obj
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v.to_string()))
+                    .collect();
+                parts.sort();
+                format!("{{ {} }}", parts.join(", "))
+            }
+            Value::Block { .. } => "<block>".to_string(),
+            Value::Function(_) => "function".to_string(),
             Value::Class(c) => format!("<class {}>", c.name),
             Value::Instance(i) => format!("<instance of {}>", i.read().unwrap().class.name),
             Value::Builtin(name) => format!("<builtin {}>", name),
