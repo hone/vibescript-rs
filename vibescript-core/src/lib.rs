@@ -883,22 +883,396 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_reference_parity() {
+        let source = "
+        def run()
+          record = { b: 2, a: 1, c: 3 }
+          with_nil = { a: 1, b: nil, c: 3 }
+          nested = { user: { profile: { name: \"Alex\" } } }
+
+          each_pairs = []
+          # record.each do |k, v|
+          #   each_pairs = each_pairs.push(k + \"=\" + v.to_string())
+          # end
+
+          select_gt1 = record.select do |k, v|
+            v > 1
+          end
+
+          reject_even = record.reject do |k, v|
+            v % 2 == 0
+          end
+
+          transform_keys = record.transform_keys do |k|
+            \"x_\" + k
+          end
+
+          transform_values = record.transform_values do |v|
+            v * 10
+          end
+
+          {
+            size: record.size,
+            length: record.length,
+            empty_false: record.empty?,
+            empty_true: {}.empty?,
+            key_symbol: record.key?(:a),
+            key_string: record.has_key?(\"b\"),
+            include_symbol: record.include?(:c),
+            missing_key: record.key?(:missing),
+            # keys: record.keys,
+            # values: record.values,
+            fetch_hit: record.fetch(:a),
+            fetch_default: record.fetch(:missing, 99),
+            fetch_nil: record.fetch(:missing),
+            dig_hit: nested.dig(:user, :profile, :name),
+            dig_miss: nested.dig(:user, :profile, :missing),
+            slice: record.slice(:a, \"c\"),
+            except: record.except(:b),
+            select_gt1: select_gt1,
+            reject_even: reject_even,
+            transform_keys: transform_keys,
+            transform_values: transform_values,
+            compact: with_nil.compact()
+          }
+        end
+        run()
+        ";
+        let result = execute(source).unwrap();
+        let h = result.as_hash().unwrap();
+        let got = h.read().unwrap();
+
+        assert_eq!(got.get("size").unwrap(), &VibeValue::Int(3));
+        assert_eq!(got.get("fetch_hit").unwrap(), &VibeValue::Int(1));
+        assert_eq!(got.get("fetch_default").unwrap(), &VibeValue::Int(99));
+        assert_eq!(
+            got.get("dig_hit").unwrap(),
+            &VibeValue::String("Alex".to_string())
+        );
+        assert_eq!(
+            got.get("compact")
+                .unwrap()
+                .as_hash()
+                .unwrap()
+                .read()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_array_reference_parity() {
+        let source = "
+        def run()
+          values = [3, 1, 2, 1]
+
+          find_hit = values.find do |v| v > 2 end
+          find_index_hit = values.find_index do |v| v % 2 == 0 end
+          count_block = values.count do |v| v > 1 end
+
+          {
+            size: values.size,
+            empty_false: values.empty?,
+            include_hit: values.include?(2),
+            index_hit: values.index(1),
+            rindex_hit: values.rindex(1),
+            fetch_hit: values.fetch(2),
+            find_hit: find_hit,
+            find_index_hit: find_index_hit,
+            count_all: values.count,
+            count_value: values.count(1),
+            count_block: count_block,
+            reverse: values.reverse,
+            flatten: [[1, 2], [3]].flatten
+          }
+        end
+        run()
+        ";
+        let result = execute(source).unwrap();
+        let h = result.as_hash().unwrap();
+        let got = h.read().unwrap();
+
+        assert_eq!(got.get("size").unwrap(), &VibeValue::Int(4));
+        assert_eq!(got.get("include_hit").unwrap(), &VibeValue::Bool(true));
+        assert_eq!(got.get("index_hit").unwrap(), &VibeValue::Int(1));
+        assert_eq!(got.get("rindex_hit").unwrap(), &VibeValue::Int(3));
+        assert_eq!(got.get("find_hit").unwrap(), &VibeValue::Int(3));
+        assert_eq!(got.get("find_index_hit").unwrap(), &VibeValue::Int(2));
+        assert_eq!(got.get("count_block").unwrap(), &VibeValue::Int(2));
+        assert_eq!(
+            got.get("flatten")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .read()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_collection_advanced_parity() {
+        let source = "
+        def run()
+          nums = [1, 2, 3, 4, 5, 6]
+          words = [\"apple\", \"bat\", \"cat\", \"apple\", \"bat\", \"apple\"]
+
+          {
+            chunk: nums.chunk(2),
+            window: [1, 2, 3].window(2),
+            partition: nums.partition do |n| n % 2 == 0 end,
+            group_by: words.group_by do |w| w.length end,
+            tally: words.tally(),
+            tally_block: words.tally do |w| w.uppercase() end,
+            sort: [3, 1, 2].sort(),
+            sort_by: [\"ccc\", \"a\", \"bb\"].sort_by do |s| s.length end,
+            reduce_sum: [1, 2, 3].reduce(10) do |acc, n| acc + n end
+          }
+        end
+        run()
+        ";
+        let result = execute(source).unwrap();
+        let h = result.as_hash().unwrap();
+        let got = h.read().unwrap();
+
+        assert_eq!(
+            got.get("chunk")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .read()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            got.get("window")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .read()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let part = got.get("partition").unwrap().as_array().unwrap();
+        assert_eq!(
+            part.read().unwrap()[0]
+                .as_array()
+                .unwrap()
+                .read()
+                .unwrap()
+                .len(),
+            3
+        ); // evens
+
+        let groups = got.get("group_by").unwrap().as_hash().unwrap();
+        assert_eq!(
+            groups
+                .read()
+                .unwrap()
+                .get("3")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .read()
+                .unwrap()
+                .len(),
+            3
+        ); // bat, cat, bat
+
+        let tally = got.get("tally").unwrap().as_hash().unwrap();
+        assert_eq!(
+            tally.read().unwrap().get("apple").unwrap(),
+            &VibeValue::Int(3)
+        );
+
+        assert_eq!(
+            got.get("sort").unwrap().as_array().unwrap().read().unwrap()[0],
+            VibeValue::Int(1)
+        );
+
+        let sorted_by = got.get("sort_by").unwrap().as_array().unwrap();
+        assert_eq!(
+            sorted_by.read().unwrap()[0],
+            VibeValue::String("a".to_string())
+        );
+
+        assert_eq!(got.get("reduce_sum").unwrap(), &VibeValue::Int(16));
+    }
+
+    #[test]
+    fn test_numeric_and_temporal_parity() {
+        let source = "
+        def run()
+          t = Time.parse(\"2024-05-01 10:30:05\", in: \"UTC\")
+          m = money(\"50.00 USD\")
+
+          counter = 0
+          3.times do |i| counter = counter + 1 end
+
+          {
+            int_abs: (-5).abs(),
+            int_even: 4.even?(),
+            int_odd: 4.odd?(),
+            int_clamp: 10.clamp(1, 5),
+            float_abs: -5.5.abs(),
+            float_round: 5.6.round(),
+            float_floor: 5.6.floor(),
+            float_ceil: 5.1.ceil(),
+            float_clamp: 10.5.clamp(1.0, 5.5),
+            times_count: counter,
+            time_year: t.year,
+            time_hour: t.hour,
+            money_cents: m.cents,
+            money_fmt: m.format()
+          }
+        end
+        run()
+        ";
+        let result = execute(source).unwrap();
+        let h = result.as_hash().unwrap();
+        let got = h.read().unwrap();
+
+        assert_eq!(got.get("int_abs").unwrap(), &VibeValue::Int(5));
+        assert_eq!(got.get("int_even").unwrap(), &VibeValue::Bool(true));
+        assert_eq!(got.get("int_clamp").unwrap(), &VibeValue::Int(5));
+        assert_eq!(got.get("float_round").unwrap(), &VibeValue::Int(6));
+        assert_eq!(got.get("float_floor").unwrap(), &VibeValue::Int(5));
+        assert_eq!(got.get("times_count").unwrap(), &VibeValue::Int(3));
+        assert_eq!(got.get("time_year").unwrap(), &VibeValue::Int(2024));
+        assert_eq!(got.get("time_hour").unwrap(), &VibeValue::Int(10));
+        assert_eq!(got.get("money_cents").unwrap(), &VibeValue::Int(5000));
+        assert_eq!(
+            got.get("money_fmt").unwrap(),
+            &VibeValue::String("50.00 USD".to_string())
+        );
+    }
+
+    #[test]
+    fn test_string_advanced_parity() {
+        let source = "
+        def run()
+          s = \"  Gwen  \"
+          {
+            chomp: \"line\\n\".chomp(),
+            squish: \"  too   many   spaces  \".squish(),
+            match: \"user_123\".match(\"user_(\\\\d+)\"),
+            scan: \"a1 b2 c3\".scan(\"\\\\d+\"),
+            sub: \"hello world\".sub(\"hello\", \"hi\"),
+            gsub: \"ba na na\".gsub(\" \", \"\"),
+            strip_bang: s.strip!(),
+            strip_bang_nil: \"Gwen\".strip!(),
+            template: \"Hello {{user.name}}!\".template({ user: { name: \"Gwen\" } })
+          }
+        end
+        run()
+        ";
+        let result = execute(source).unwrap();
+        let h = result.as_hash().unwrap();
+        let got = h.read().unwrap();
+
+        assert_eq!(
+            got.get("chomp").unwrap(),
+            &VibeValue::String("line".to_string())
+        );
+        assert_eq!(
+            got.get("squish").unwrap(),
+            &VibeValue::String("too many spaces".to_string())
+        );
+
+        let mat = got.get("match").unwrap().as_array().unwrap();
+        assert_eq!(mat.read().unwrap()[1], VibeValue::String("123".to_string()));
+
+        let scan = got.get("scan").unwrap().as_array().unwrap();
+        assert_eq!(scan.read().unwrap().len(), 3);
+
+        assert_eq!(
+            got.get("sub").unwrap(),
+            &VibeValue::String("hi world".to_string())
+        );
+        assert_eq!(
+            got.get("gsub").unwrap(),
+            &VibeValue::String("banana".to_string())
+        );
+        assert_eq!(
+            got.get("strip_bang").unwrap(),
+            &VibeValue::String("Gwen".to_string())
+        );
+        assert_eq!(got.get("strip_bang_nil").unwrap(), &VibeValue::Nil);
+        assert_eq!(
+            got.get("template").unwrap(),
+            &VibeValue::String("Hello Gwen!".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stdlib_final_parity() {
+        let source = "
+        def run()
+          # Array.sample
+          arr = [1, 2, 3]
+          s1 = arr.sample()
+          s2 = arr.sample(2)
+
+          # Hash helpers
+          h = { a: 1, b: 2 }
+          remapped = h.remap_keys({ a: :alpha })
+
+          deep_h = { user: { name: \"Gwen\" } }
+          deep_transformed = deep_h.deep_transform_keys do |k| k.upcase() end
+
+          # Duration offsets
+          anchor = Time.parse(\"2024-05-01 10:00:00\", in: \"UTC\")
+
+          {
+            sample_single: arr.include?(s1),
+            sample_multi_len: s2.length,
+            remap_hit: remapped.key?(:alpha),
+            remap_old_miss: remapped.key?(:a),
+            deep_key: deep_transformed.fetch(:USER).key?(:NAME),
+            ago: 1.hours.ago(anchor).format(\"15:04:05\"),
+            after: 30.minutes.after(anchor).format(\"15:04:05\")
+          }
+        end
+        run()
+        ";
+        let result = execute(source).unwrap();
+        let h = result.as_hash().unwrap();
+        let got = h.read().unwrap();
+
+        assert_eq!(got.get("sample_single").unwrap(), &VibeValue::Bool(true));
+        assert_eq!(got.get("sample_multi_len").unwrap(), &VibeValue::Int(2));
+        assert_eq!(got.get("remap_hit").unwrap(), &VibeValue::Bool(true));
+        assert_eq!(got.get("remap_old_miss").unwrap(), &VibeValue::Bool(false));
+        assert_eq!(got.get("deep_key").unwrap(), &VibeValue::Bool(true));
+        assert_eq!(
+            got.get("ago").unwrap(),
+            &VibeValue::String("09:00:00UTC".to_string())
+        );
+        assert_eq!(
+            got.get("after").unwrap(),
+            &VibeValue::String("10:30:00UTC".to_string())
+        );
+    }
+
+    #[test]
     fn test_array_mutation() {
         let source = "
             arr = [1, 2]
-            other = arr
-            arr.push(3)
-            other[0] = 10
-            arr
+            other = arr.push(3)
+            # push returns a NEW array, arr is still [1, 2]
+            arr[0] = 10
+            # but index assignment IS mutating!
+            [arr.length, arr[0]]
         ";
         let result = execute(source).unwrap();
         assert_eq!(
             result,
-            VibeValue::new_array(vec![
-                VibeValue::Int(10),
-                VibeValue::Int(2),
-                VibeValue::Int(3)
-            ])
+            VibeValue::new_array(vec![VibeValue::Int(2), VibeValue::Int(10)])
         );
     }
 }

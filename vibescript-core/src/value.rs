@@ -210,6 +210,24 @@ impl PartialEq for Value {
     }
 }
 
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Int(l), Value::Int(r)) => l.partial_cmp(r),
+            (Value::Float(l), Value::Float(r)) => l.partial_cmp(r),
+            (Value::Int(l), Value::Float(r)) => (*l as f64).partial_cmp(r),
+            (Value::Float(l), Value::Int(r)) => l.partial_cmp(&(*r as f64)),
+            (Value::String(l), Value::String(r)) => l.partial_cmp(r),
+            (Value::Symbol(l), Value::Symbol(r)) => l.partial_cmp(r),
+            (Value::Bool(l), Value::Bool(r)) => l.partial_cmp(r),
+            (Value::Time(l), Value::Time(r)) => l.partial_cmp(r),
+            (Value::Duration(l), Value::Duration(r)) => l.partial_cmp(r),
+            (Value::Money { cents: l, .. }, Value::Money { cents: r, .. }) => l.partial_cmp(r),
+            _ => None,
+        }
+    }
+}
+
 impl Value {
     pub fn new_array(vec: Vec<Value>) -> Self {
         Value::Array(Arc::new(RwLock::new(vec)))

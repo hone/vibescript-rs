@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::value::{ClassDef, FunctionDef, InstanceData, Param, Value};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 use rand::{Rng, distributions::Alphanumeric};
 use regex::Regex;
 use std::collections::HashMap;
@@ -104,6 +104,58 @@ impl Engine {
             }
         }
         Ok(last_val)
+    }
+
+    fn flatten_array(&self, arr: Vec<Value>, depth: i64) -> Vec<Value> {
+        let mut result = Vec::new();
+        for val in arr {
+            if let Value::Array(inner_lock) = val {
+                if depth != 0 {
+                    let inner = inner_lock.read().unwrap();
+                    let flattened =
+                        self.flatten_array(inner.clone(), if depth > 0 { depth - 1 } else { -1 });
+                    result.extend(flattened);
+                } else {
+                    result.push(Value::Array(inner_lock));
+                }
+            } else {
+                result.push(val);
+            }
+        }
+        result
+    }
+
+    fn deep_transform_hash_keys(
+        &mut self,
+        hash: &HashMap<String, Value>,
+        params: &[String],
+        body: &[Stmt],
+    ) -> Result<HashMap<String, Value>, EvalError> {
+        let mut new_map = HashMap::new();
+        let keys: Vec<String> = hash.keys().cloned().collect();
+        for k in keys {
+            let mut val = hash.get(&k).unwrap().clone();
+            if let Value::Hash(inner_lock) = val {
+                let inner = inner_lock.read().unwrap();
+                let transformed = self.deep_transform_hash_keys(&inner, params, body)?;
+                val = Value::new_hash(transformed);
+            }
+
+            let mut scope = HashMap::new();
+            if let Some(p) = params.first() {
+                scope.insert(p.clone(), Value::Symbol(k));
+            }
+            self.stack.push(scope);
+            let res = self.eval_block(body)?;
+            self.stack.pop();
+
+            let new_key = match res.value() {
+                Value::String(s) | Value::Symbol(s) => s,
+                v => v.to_string(),
+            };
+            new_map.insert(new_key, val);
+        }
+        Ok(new_map)
     }
 
     fn builtin_require(
@@ -250,7 +302,8 @@ impl Engine {
                     match self.eval_block(body)? {
                         ControlFlow::Break(v) => return Ok(ControlFlow::Continue(v)),
                         ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
-                        cf => last_val = cf.value(),
+                        ControlFlow::Next(_) => continue,
+                        ControlFlow::Continue(v) => last_val = v,
                     }
                 }
                 Ok(ControlFlow::Continue(last_val))
@@ -265,7 +318,8 @@ impl Engine {
                     match self.eval_block(body)? {
                         ControlFlow::Break(v) => return Ok(ControlFlow::Continue(v)),
                         ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
-                        cf => last_val = cf.value(),
+                        ControlFlow::Next(_) => continue,
+                        ControlFlow::Continue(v) => last_val = v,
                     }
                 }
                 Ok(ControlFlow::Continue(last_val))
@@ -287,7 +341,8 @@ impl Engine {
                                 break;
                             }
                             ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
-                            cf => last_val = cf.value(),
+                            ControlFlow::Next(_) => continue,
+                            ControlFlow::Continue(v) => last_val = v,
                         }
                     }
                 }
@@ -483,7 +538,6 @@ impl Engine {
                 match func.as_str() {
                     "money" => {
                         if let Some(Value::String(s)) = arg_vals.first() {
-                            // "50.00 USD" -> 5000 cents
                             let parts: Vec<&str> = s.split_whitespace().collect();
                             if parts.len() == 2 {
                                 let amount: f64 = parts[0].parse().unwrap_or(0.0);
@@ -514,24 +568,50 @@ impl Engine {
                     "uuid" => return Ok(Value::String(Uuid::new_v4().to_string())),
                     "now" => return Ok(Value::Time(Utc::now())),
                     "to_int" => {
-                        return Ok(arg_vals
-                            .first()
-                            .and_then(|v| v.as_int())
-                            .map(Value::Int)
-                            .unwrap_or(Value::Nil));
+                        if let Some(val) = arg_vals.first() {
+                            match val {
+                                Value::Int(i) => return Ok(Value::Int(*i)),
+                                Value::Float(f) => return Ok(Value::Int(*f as i64)),
+                                Value::String(s) => {
+                                    if let Ok(i) = s.parse::<i64>() {
+                                        return Ok(Value::Int(i));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        return Ok(Value::Nil);
                     }
                     "to_float" => {
-                        return Ok(arg_vals
-                            .first()
-                            .and_then(|v| v.as_float())
-                            .map(Value::Float)
-                            .unwrap_or(Value::Nil));
+                        if let Some(val) = arg_vals.first() {
+                            match val {
+                                Value::Int(i) => return Ok(Value::Float(*i as f64)),
+                                Value::Float(f) => return Ok(Value::Float(*f)),
+                                Value::String(s) => {
+                                    if let Ok(f) = s.parse::<f64>() {
+                                        return Ok(Value::Float(f));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        return Ok(Value::Nil);
                     }
                     "random_id" => {
-                        let len = arg_vals.first().and_then(|v| v.as_int()).unwrap_or(16) as usize;
+                        let len = arg_vals.first().and_then(|v| v.as_int()).unwrap_or(16);
+                        if len <= 0 {
+                            return Err(EvalError::Message(
+                                "random_id length must be positive".to_string(),
+                            ));
+                        }
+                        if len > 1024 {
+                            return Err(EvalError::Message(
+                                "random_id length exceeds maximum 1024".to_string(),
+                            ));
+                        }
                         let s: String = rand::thread_rng()
                             .sample_iter(&Alphanumeric)
-                            .take(len)
+                            .take(len as usize)
                             .map(char::from)
                             .collect();
                         return Ok(Value::String(s));
@@ -690,6 +770,16 @@ impl Engine {
     }
 
     fn set_var(&mut self, name: &str, val: Value) {
+        for scope in self.stack.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_string(), val);
+                return;
+            }
+        }
+        if self.globals.contains_key(name) {
+            self.globals.insert(name.to_string(), val);
+            return;
+        }
         if let Some(scope) = self.stack.last_mut() {
             scope.insert(name.to_string(), val);
         } else {
@@ -844,7 +934,6 @@ impl Engine {
                 }
                 ("Time", "parse") => {
                     if let Some(Value::String(s)) = args.first() {
-                        // Try various formats
                         let t = DateTime::parse_from_rfc3339(s)
                             .map(|dt| dt.with_timezone(&Utc))
                             .or_else(|_| {
@@ -905,7 +994,10 @@ impl Engine {
             }
         }
 
-        // High priority: Standard methods
+        if method == "to_string" {
+            return Ok(Value::String(receiver.to_string()));
+        }
+
         match (receiver.clone(), method, block) {
             (Value::Object(o), method, _) => {
                 let obj = o.read().unwrap();
@@ -923,8 +1015,8 @@ impl Engine {
                     )));
                 }
             }
-            (Value::Hash(h), method, _) => {
-                let hash = h.read().unwrap();
+            (Value::Hash(h), method, block) => {
+                let hash = h.read().unwrap().clone();
                 if let Some(val) = hash.get(method).cloned() {
                     if let Value::Function(f) = val {
                         return self
@@ -932,191 +1024,1484 @@ impl Engine {
                             .map(|cf| cf.value());
                     }
                     return Ok(val);
-                } else if method == "length" || method == "size" {
-                    return Ok(Value::Int(hash.len() as i64));
-                } else if method == "fetch" {
-                    if let Some(Value::String(key)) = args.first() {
-                        if let Some(val) = hash.get(key) {
-                            return Ok(val.clone());
+                }
+                match method {
+                    "length" | "size" => Ok(Value::Int(hash.len() as i64)),
+                    "empty?" => Ok(Value::Bool(hash.is_empty())),
+                    "key?" | "has_key?" | "include?" => {
+                        if let Some(arg) = args.first() {
+                            let key = match arg {
+                                Value::String(s) | Value::Symbol(s) => s.clone(),
+                                _ => return Ok(Value::Bool(false)),
+                            };
+                            Ok(Value::Bool(hash.contains_key(&key)))
+                        } else {
+                            Ok(Value::Bool(false))
                         }
-                        if args.len() == 2 {
-                            return Ok(args[1].clone());
-                        }
-                        return Ok(Value::Nil);
-                    } else if let Some(Value::Symbol(key)) = args.first() {
-                        if let Some(val) = hash.get(key) {
-                            return Ok(val.clone());
-                        }
-                        if args.len() == 2 {
-                            return Ok(args[1].clone());
-                        }
-                        return Ok(Value::Nil);
                     }
-                    return Err(EvalError::Message(
-                        "Hash.fetch expects a string or symbol key".to_string(),
-                    ));
-                } else if method == "keys" {
-                    let keys = hash.keys().map(|k| Value::String(k.clone())).collect();
-                    return Ok(Value::new_array(keys));
-                } else if method == "values" {
-                    let values = hash.values().cloned().collect();
-                    return Ok(Value::new_array(values));
-                } else if method == "merge" {
-                    if let Some(other_val) = args.first() {
-                        if let Some(other_hash_lock) = other_val.as_hash() {
-                            let other_hash = other_hash_lock.read().unwrap();
-                            let mut new_map = (*hash).clone();
-                            for (k, v) in other_hash.iter() {
+                    "fetch" => {
+                        if let Some(arg) = args.first() {
+                            let key = match arg {
+                                Value::String(s) | Value::Symbol(s) => s.clone(),
+                                _ => {
+                                    return Err(EvalError::Message(
+                                        "Hash.fetch key must be string or symbol".to_string(),
+                                    ));
+                                }
+                            };
+                            if let Some(val) = hash.get(&key) {
+                                return Ok(val.clone());
+                            }
+                            if args.len() == 2 {
+                                return Ok(args[1].clone());
+                            }
+                            Ok(Value::Nil)
+                        } else {
+                            Err(EvalError::Message("Hash.fetch expects a key".to_string()))
+                        }
+                    }
+                    "keys" => {
+                        let mut keys: Vec<String> = hash.keys().cloned().collect();
+                        keys.sort();
+                        let vals = keys.into_iter().map(Value::Symbol).collect();
+                        Ok(Value::new_array(vals))
+                    }
+                    "values" => {
+                        let mut keys: Vec<String> = hash.keys().cloned().collect();
+                        keys.sort();
+                        let vals = keys
+                            .into_iter()
+                            .map(|k| hash.get(&k).unwrap().clone())
+                            .collect();
+                        Ok(Value::new_array(vals))
+                    }
+                    "compact" => {
+                        let mut new_map = HashMap::new();
+                        for (k, v) in hash.iter() {
+                            if !v.is_nil() {
                                 new_map.insert(k.clone(), v.clone());
                             }
-                            return Ok(Value::new_hash(new_map));
+                        }
+                        Ok(Value::new_hash(new_map))
+                    }
+                    "each_key" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let keys: Vec<String> = hash.keys().cloned().collect();
+                            for k in keys {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), Value::Symbol(k));
+                                }
+                                self.stack.push(scope);
+                                let cf = self.eval_block(body)?;
+                                self.stack.pop();
+                                if !cf.is_continue() {
+                                    if matches!(cf, ControlFlow::Break(_)) {
+                                        break;
+                                    }
+                                    return Ok(cf.value());
+                                }
+                            }
+                            Ok(Value::Hash(h.clone()))
+                        } else {
+                            Err(EvalError::Message("each_key requires a block".to_string()))
                         }
                     }
-                    return Err(EvalError::Message(
-                        "Hash.merge expects another Hash argument".to_string(),
-                    ));
-                } else {
-                    return Err(EvalError::Message(format!(
+                    "each_value" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let values: Vec<Value> = hash.values().cloned().collect();
+                            for v in values {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), v);
+                                }
+                                self.stack.push(scope);
+                                let cf = self.eval_block(body)?;
+                                self.stack.pop();
+                                if !cf.is_continue() {
+                                    if matches!(cf, ControlFlow::Break(_)) {
+                                        break;
+                                    }
+                                    return Ok(cf.value());
+                                }
+                            }
+                            Ok(Value::Hash(h.clone()))
+                        } else {
+                            Err(EvalError::Message(
+                                "each_value requires a block".to_string(),
+                            ))
+                        }
+                    }
+                    "deep_transform_keys" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let res = self.deep_transform_hash_keys(&hash, params, body)?;
+                            Ok(Value::new_hash(res))
+                        } else {
+                            Err(EvalError::Message(
+                                "deep_transform_keys requires a block".to_string(),
+                            ))
+                        }
+                    }
+                    "remap_keys" => {
+                        if let Some(Value::Hash(mapping_lock)) = args.first() {
+                            let mapping = mapping_lock.read().unwrap();
+                            let mut new_map = HashMap::new();
+                            for (k, v) in hash.iter() {
+                                if let Some(new_key_val) = mapping.get(k) {
+                                    let new_key = match new_key_val {
+                                        Value::String(s) | Value::Symbol(s) => s.clone(),
+                                        _ => {
+                                            return Err(EvalError::Message(
+                                                "remap_keys mapping values must be symbol or string"
+                                                    .to_string(),
+                                            ));
+                                        }
+                                    };
+                                    new_map.insert(new_key, v.clone());
+                                } else {
+                                    new_map.insert(k.clone(), v.clone());
+                                }
+                            }
+                            Ok(Value::new_hash(new_map))
+                        } else {
+                            Err(EvalError::Message(
+                                "remap_keys expects a mapping hash".to_string(),
+                            ))
+                        }
+                    }
+                    "merge" => {
+                        if let Some(other_val) = args.first() {
+                            if let Some(other_hash_lock) = other_val.as_hash() {
+                                let other_hash = other_hash_lock.read().unwrap();
+                                let mut new_map = hash.clone();
+                                for (k, v) in other_hash.iter() {
+                                    new_map.insert(k.clone(), v.clone());
+                                }
+                                return Ok(Value::new_hash(new_map));
+                            }
+                        }
+                        Err(EvalError::Message(
+                            "Hash.merge expects another Hash".to_string(),
+                        ))
+                    }
+                    "dig" => {
+                        let mut current_dig = receiver.clone();
+                        for arg in args {
+                            let key = match arg {
+                                Value::String(s) | Value::Symbol(s) => s.clone(),
+                                _ => {
+                                    return Err(EvalError::Message(
+                                        "dig keys must be symbols or strings".to_string(),
+                                    ));
+                                }
+                            };
+                            match current_dig {
+                                Value::Hash(h_lock) | Value::Object(h_lock) => {
+                                    let next = h_lock.read().unwrap().get(&key).cloned();
+                                    if let Some(val) = next {
+                                        current_dig = val;
+                                    } else {
+                                        return Ok(Value::Nil);
+                                    }
+                                }
+                                _ => return Ok(Value::Nil),
+                            }
+                        }
+                        Ok(current_dig)
+                    }
+                    "slice" => {
+                        let mut new_map = HashMap::new();
+                        for arg in args {
+                            let key = match arg {
+                                Value::String(s) | Value::Symbol(s) => s.clone(),
+                                _ => continue,
+                            };
+                            if let Some(val) = hash.get(&key).cloned() {
+                                new_map.insert(key, val);
+                            }
+                        }
+                        Ok(Value::new_hash(new_map))
+                    }
+                    "except" => {
+                        let mut new_map = hash.clone();
+                        for arg in args {
+                            if let Some(s) = arg.as_str() {
+                                new_map.remove(s);
+                            } else if let Value::Symbol(s) = arg {
+                                new_map.remove(&s);
+                            }
+                        }
+                        Ok(Value::new_hash(new_map))
+                    }
+                    "select" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut new_map = HashMap::new();
+                            let mut keys: Vec<String> = hash.keys().cloned().collect();
+                            keys.sort();
+                            for k in keys {
+                                let v = hash.get(&k).unwrap().clone();
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), Value::Symbol(k.clone()));
+                                }
+                                if let Some(p) = params.get(1) {
+                                    scope.insert(p.clone(), v.clone());
+                                }
+                                self.stack.push(scope);
+                                let res = self.eval_block(body)?;
+                                self.stack.pop();
+                                if self.is_truthy(&res.value()) {
+                                    new_map.insert(k, v);
+                                }
+                            }
+                            Ok(Value::new_hash(new_map))
+                        } else {
+                            Err(EvalError::Message("select requires a block".to_string()))
+                        }
+                    }
+                    "reject" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut new_map = HashMap::new();
+                            let mut keys: Vec<String> = hash.keys().cloned().collect();
+                            keys.sort();
+                            for k in keys {
+                                let v = hash.get(&k).unwrap().clone();
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), Value::Symbol(k.clone()));
+                                }
+                                if let Some(p) = params.get(1) {
+                                    scope.insert(p.clone(), v.clone());
+                                }
+                                self.stack.push(scope);
+                                let res = self.eval_block(body)?;
+                                self.stack.pop();
+                                if !self.is_truthy(&res.value()) {
+                                    new_map.insert(k, v);
+                                }
+                            }
+                            Ok(Value::new_hash(new_map))
+                        } else {
+                            Err(EvalError::Message("reject requires a block".to_string()))
+                        }
+                    }
+                    "transform_keys" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut new_map = HashMap::new();
+                            let mut keys: Vec<String> = hash.keys().cloned().collect();
+                            keys.sort();
+                            for k in keys {
+                                let v = hash.get(&k).unwrap().clone();
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), Value::Symbol(k.clone()));
+                                }
+                                self.stack.push(scope);
+                                let res = self.eval_block(body)?;
+                                self.stack.pop();
+                                let new_key = match res.value() {
+                                    Value::String(s) | Value::Symbol(s) => s,
+                                    v => v.to_string(),
+                                };
+                                new_map.insert(new_key, v);
+                            }
+                            Ok(Value::new_hash(new_map))
+                        } else {
+                            Err(EvalError::Message(
+                                "transform_keys requires a block".to_string(),
+                            ))
+                        }
+                    }
+                    "transform_values" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut new_map = HashMap::new();
+                            let mut keys: Vec<String> = hash.keys().cloned().collect();
+                            keys.sort();
+                            for k in keys {
+                                let v = hash.get(&k).unwrap().clone();
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), v);
+                                }
+                                self.stack.push(scope);
+                                let res = self.eval_block(body)?;
+                                self.stack.pop();
+                                new_map.insert(k, res.value());
+                            }
+                            Ok(Value::new_hash(new_map))
+                        } else {
+                            Err(EvalError::Message(
+                                "transform_values requires a block".to_string(),
+                            ))
+                        }
+                    }
+                    "[]=" => {
+                        if args.len() < 2 {
+                            return Err(EvalError::Message(
+                                "[]= expects key and value".to_string(),
+                            ));
+                        }
+                        if let Value::String(s) = &args[0] {
+                            h.write().unwrap().insert(s.clone(), args[1].clone());
+                            Ok(args[1].clone())
+                        } else {
+                            Err(EvalError::Message("Hash key must be string".to_string()))
+                        }
+                    }
+                    _ => Err(EvalError::Message(format!(
                         "Method '{}' not supported for Hash and key not found",
                         method
-                    )));
+                    ))),
                 }
             }
-            (Value::Array(a), method, _) => {
-                if method == "length" || method == "size" {
-                    return Ok(Value::Int(a.read().unwrap().len() as i64));
-                } else if method == "fetch" {
-                    let arr = a.read().unwrap();
-                    if let Some(idx) = args.first().and_then(|v| v.as_int()) {
-                        let i = idx as usize;
-                        if i < arr.len() {
-                            return Ok(arr[i].clone());
-                        }
-                        if args.len() == 2 {
-                            return Ok(args[1].clone());
-                        }
-                        return Ok(Value::Nil);
-                    }
-                    return Err(EvalError::Message(
-                        "Array.fetch expects an integer index".to_string(),
-                    ));
-                } else if method == "first" {
-                    let arr = a.read().unwrap();
-                    if let Some(count_val) = args.first() {
-                        if let Some(count) = count_val.as_int() {
-                            let n = count as usize;
-                            let sub: Vec<Value> = arr.iter().take(n).cloned().collect();
-                            return Ok(Value::new_array(sub));
-                        }
-                    }
-                    return Ok(arr.first().cloned().unwrap_or(Value::Nil));
-                } else if method == "last" {
-                    let arr = a.read().unwrap();
-                    if let Some(count_val) = args.first() {
-                        if let Some(count) = count_val.as_int() {
-                            let n = count as usize;
-                            let start = if arr.len() > n { arr.len() - n } else { 0 };
-                            let sub: Vec<Value> = arr.iter().skip(start).cloned().collect();
-                            return Ok(Value::new_array(sub));
-                        }
-                    }
-                    return Ok(arr.last().cloned().unwrap_or(Value::Nil));
-                } else if method == "reverse" {
-                    let arr = a.read().unwrap();
-                    let rev: Vec<Value> = arr.iter().rev().cloned().collect();
-                    return Ok(Value::new_array(rev));
-                } else if method == "join" {
-                    let arr = a.read().unwrap();
-                    let sep = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
-                    let joined = arr
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<String>>()
-                        .join(sep);
-                    return Ok(Value::String(joined));
-                } else if method == "empty?" {
-                    return Ok(Value::Bool(a.read().unwrap().is_empty()));
-                } else if method == "include?" || method == "contains?" {
-                    if let Some(target) = args.first() {
-                        return Ok(Value::Bool(a.read().unwrap().contains(target)));
-                    }
-                    return Ok(Value::Bool(false));
-                } else if method == "push" {
-                    let mut arr = a.write().unwrap();
-                    for arg in args {
-                        arr.push(arg.clone());
-                    }
-                    return Ok(Value::Array(a.clone()));
-                } else if method == "pop" {
-                    return Ok(a.write().unwrap().pop().unwrap_or(Value::Nil));
-                } else if method == "sum" {
-                    let arr = a.read().unwrap();
-                    let mut sum_int = 0;
-                    let mut sum_float = 0.0;
-                    let mut has_float = false;
-                    for v in arr.iter() {
-                        if let Some(i) = v.as_int() {
-                            sum_int += i;
-                            sum_float += i as f64;
-                        } else if let Some(f) = v.as_float() {
-                            sum_float += f;
-                            has_float = true;
-                        }
-                    }
-                    if has_float {
-                        return Ok(Value::Float(sum_float));
-                    } else {
-                        return Ok(Value::Int(sum_int));
-                    }
-                } else if method == "compact" {
-                    let arr = a.read().unwrap();
-                    let compacted: Vec<Value> = arr
-                        .iter()
-                        .filter(|v| !matches!(v, Value::Nil))
-                        .cloned()
-                        .collect();
-                    return Ok(Value::new_array(compacted));
-                } else if method == "uniq" {
-                    let arr = a.read().unwrap();
-                    let mut unique: Vec<Value> = Vec::new();
-                    for v in arr.iter() {
-                        if !unique.contains(v) {
-                            unique.push(v.clone());
-                        }
-                    }
-                    return Ok(Value::new_array(unique));
-                } else if method == "[]=" {
-                    if args.len() < 2 {
-                        return Err(EvalError::Message(
-                            "[]= expects an index and a value".to_string(),
-                        ));
-                    }
-                    let idx_val = &args[0];
-                    let new_val = &args[1];
-                    if let Some(idx) = idx_val.as_int() {
-                        let mut arr = a.write().unwrap();
-                        let i = idx as usize;
-                        if i < arr.len() {
-                            arr[i] = new_val.clone();
-                            return Ok(new_val.clone());
+            (Value::Array(a), method, block) => {
+                let arr_snapshot = a.read().unwrap().clone();
+                match method {
+                    "length" | "size" => Ok(Value::Int(arr_snapshot.len() as i64)),
+                    "empty?" => Ok(Value::Bool(arr_snapshot.is_empty())),
+                    "include?" | "contains?" => {
+                        if let Some(target) = args.first() {
+                            Ok(Value::Bool(arr_snapshot.contains(target)))
                         } else {
-                            return Err(EvalError::Message(format!(
-                                "Index {} out of bounds for array of length {}",
-                                i,
-                                arr.len()
-                            )));
+                            Ok(Value::Bool(false))
                         }
-                    } else {
-                        return Err(EvalError::Message(
-                            "Array index must be an integer".to_string(),
-                        ));
                     }
+                    "fetch" => {
+                        if let Some(idx) = args.first().and_then(|v| v.as_int()) {
+                            let i = idx as usize;
+                            if i < arr_snapshot.len() {
+                                return Ok(arr_snapshot[i].clone());
+                            }
+                            if args.len() == 2 {
+                                return Ok(args[1].clone());
+                            }
+                            Ok(Value::Nil)
+                        } else {
+                            Err(EvalError::Message(
+                                "Array.fetch expects an integer index".to_string(),
+                            ))
+                        }
+                    }
+                    "index" => {
+                        if let Some(target) = args.first() {
+                            let offset = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+                            if offset >= arr_snapshot.len() {
+                                return Ok(Value::Nil);
+                            }
+                            if let Some(pos) =
+                                arr_snapshot.iter().skip(offset).position(|v| v == target)
+                            {
+                                return Ok(Value::Int((offset + pos) as i64));
+                            }
+                        }
+                        Ok(Value::Nil)
+                    }
+                    "rindex" => {
+                        if let Some(target) = args.first() {
+                            let offset = args
+                                .get(1)
+                                .and_then(|v| v.as_int())
+                                .unwrap_or(arr_snapshot.len() as i64 - 1)
+                                as isize;
+                            if offset < 0 {
+                                return Ok(Value::Nil);
+                            }
+                            let limit = (offset as usize).min(arr_snapshot.len().saturating_sub(1));
+                            if let Some(pos) =
+                                arr_snapshot[..=limit].iter().rposition(|v| v == target)
+                            {
+                                return Ok(Value::Int(pos as i64));
+                            }
+                        }
+                        Ok(Value::Nil)
+                    }
+                    "find" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            for val in arr_snapshot.iter() {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let cf = self.eval_block(body)?;
+                                self.stack.pop();
+                                if self.is_truthy(&cf.value()) {
+                                    return Ok(val.clone());
+                                }
+                            }
+                            Ok(Value::Nil)
+                        } else {
+                            Err(EvalError::Message("find requires a block".to_string()))
+                        }
+                    }
+                    "find_index" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            for (idx, val) in arr_snapshot.iter().enumerate() {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let cf = self.eval_block(body)?;
+                                self.stack.pop();
+                                if self.is_truthy(&cf.value()) {
+                                    return Ok(Value::Int(idx as i64));
+                                }
+                            }
+                            Ok(Value::Nil)
+                        } else {
+                            Err(EvalError::Message(
+                                "find_index requires a block".to_string(),
+                            ))
+                        }
+                    }
+                    "push" => {
+                        let mut new_vec = arr_snapshot.clone();
+                        for arg in args {
+                            new_vec.push(arg);
+                        }
+                        Ok(Value::new_array(new_vec))
+                    }
+                    "pop" => {
+                        let mut new_vec = arr_snapshot.clone();
+                        let count_val = args.first().and_then(|v| v.as_int()).unwrap_or(1);
+                        let count = if count_val < 0 { 0 } else { count_val as usize };
+                        let mut removed = Vec::new();
+                        for _ in 0..count {
+                            if let Some(val) = new_vec.pop() {
+                                removed.push(val);
+                            } else {
+                                break;
+                            }
+                        }
+                        let mut result = HashMap::new();
+                        result.insert("array".to_string(), Value::new_array(new_vec));
+                        if args.is_empty() {
+                            result.insert(
+                                "popped".to_string(),
+                                removed.first().cloned().unwrap_or(Value::Nil),
+                            );
+                        } else {
+                            removed.reverse();
+                            result.insert("popped".to_string(), Value::new_array(removed));
+                        }
+                        Ok(Value::new_hash(result))
+                    }
+                    "first" => {
+                        if let Some(count_val) = args.first().and_then(|v| v.as_int()) {
+                            let n = count_val as usize;
+                            let sub: Vec<Value> = arr_snapshot.iter().take(n).cloned().collect();
+                            Ok(Value::new_array(sub))
+                        } else {
+                            Ok(arr_snapshot.first().cloned().unwrap_or(Value::Nil))
+                        }
+                    }
+                    "last" => {
+                        if let Some(count_val) = args.first().and_then(|v| v.as_int()) {
+                            let n = count_val as usize;
+                            let start = if arr_snapshot.len() > n {
+                                arr_snapshot.len() - n
+                            } else {
+                                0
+                            };
+                            let sub: Vec<Value> =
+                                arr_snapshot.iter().skip(start).cloned().collect();
+                            Ok(Value::new_array(sub))
+                        } else {
+                            Ok(arr_snapshot.last().cloned().unwrap_or(Value::Nil))
+                        }
+                    }
+                    "reverse" => {
+                        let rev: Vec<Value> = arr_snapshot.iter().rev().cloned().collect();
+                        Ok(Value::new_array(rev))
+                    }
+                    "join" => {
+                        let sep = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                        let joined = arr_snapshot
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(sep);
+                        Ok(Value::String(joined))
+                    }
+                    "sum" => {
+                        let mut sum_int = 0;
+                        let mut sum_float = 0.0;
+                        let mut has_float = false;
+                        for v in arr_snapshot.iter() {
+                            if let Some(i) = v.as_int() {
+                                sum_int += i;
+                                sum_float += i as f64;
+                            } else if let Some(f) = v.as_float() {
+                                sum_float += f;
+                                has_float = true;
+                            }
+                        }
+                        if has_float {
+                            Ok(Value::Float(sum_float))
+                        } else {
+                            Ok(Value::Int(sum_int))
+                        }
+                    }
+                    "compact" => {
+                        let compacted: Vec<Value> = arr_snapshot
+                            .iter()
+                            .filter(|v| !v.is_nil())
+                            .cloned()
+                            .collect();
+                        Ok(Value::new_array(compacted))
+                    }
+                    "uniq" => {
+                        let mut unique: Vec<Value> = Vec::new();
+                        for v in arr_snapshot.iter() {
+                            if !unique.contains(v) {
+                                unique.push(v.clone());
+                            }
+                        }
+                        Ok(Value::new_array(unique))
+                    }
+                    "flatten" => {
+                        let depth = args.first().and_then(|v| v.as_int()).unwrap_or(-1);
+                        let flattened = self.flatten_array(arr_snapshot.clone(), depth);
+                        Ok(Value::new_array(flattened))
+                    }
+                    "count" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut total = 0;
+                            for val in arr_snapshot.iter() {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let cf = self.eval_block(body)?;
+                                self.stack.pop();
+                                if self.is_truthy(&cf.value()) {
+                                    total += 1;
+                                }
+                            }
+                            Ok(Value::Int(total))
+                        } else if let Some(target) = args.first() {
+                            let total = arr_snapshot.iter().filter(|v| *v == target).count();
+                            Ok(Value::Int(total as i64))
+                        } else {
+                            Ok(Value::Int(arr_snapshot.len() as i64))
+                        }
+                    }
+                    "chunk" => {
+                        let size = args.first().and_then(|v| v.as_int()).unwrap_or(0);
+                        if size <= 0 {
+                            return Err(EvalError::Message(
+                                "chunk size must be positive".to_string(),
+                            ));
+                        }
+                        let chunks: Vec<Value> = arr_snapshot
+                            .chunks(size as usize)
+                            .map(|c| Value::new_array(c.to_vec()))
+                            .collect();
+                        Ok(Value::new_array(chunks))
+                    }
+                    "window" => {
+                        let size = args.first().and_then(|v| v.as_int()).unwrap_or(0);
+                        if size <= 0 {
+                            return Err(EvalError::Message(
+                                "window size must be positive".to_string(),
+                            ));
+                        }
+                        if size as usize > arr_snapshot.len() {
+                            return Ok(Value::new_array(vec![]));
+                        }
+                        let windows: Vec<Value> = arr_snapshot
+                            .windows(size as usize)
+                            .map(|w| Value::new_array(w.to_vec()))
+                            .collect();
+                        Ok(Value::new_array(windows))
+                    }
+                    "sample" => {
+                        if arr_snapshot.is_empty() {
+                            return Ok(Value::Nil);
+                        }
+                        let mut rng = rand::thread_rng();
+                        if let Some(count_val) = args.first().and_then(|v| v.as_int()) {
+                            let count = count_val.max(0) as usize;
+                            if count == 0 {
+                                return Ok(Value::new_array(vec![]));
+                            }
+                            let mut indices: Vec<usize> = (0..arr_snapshot.len()).collect();
+                            use rand::seq::SliceRandom;
+                            indices.shuffle(&mut rng);
+                            let sampled: Vec<Value> = indices
+                                .into_iter()
+                                .take(count)
+                                .map(|i| arr_snapshot[i].clone())
+                                .collect();
+                            Ok(Value::new_array(sampled))
+                        } else {
+                            use rand::Rng;
+                            let idx = rng.gen_range(0..arr_snapshot.len());
+                            Ok(arr_snapshot[idx].clone())
+                        }
+                    }
+                    "each" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            for val in arr_snapshot.iter() {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let cf = self.eval_block(body)?;
+                                self.stack.pop();
+                                if !cf.is_continue() {
+                                    if matches!(cf, ControlFlow::Break(_)) {
+                                        break;
+                                    }
+                                    return Ok(cf.value());
+                                }
+                            }
+                            Ok(Value::Array(a.clone()))
+                        } else {
+                            Err(EvalError::Message("each requires a block".to_string()))
+                        }
+                    }
+                    "map" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut results = Vec::new();
+                            for val in arr_snapshot.iter() {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let cf = self.eval_block(body)?;
+                                self.stack.pop();
+                                results.push(cf.value());
+                            }
+                            Ok(Value::new_array(results))
+                        } else {
+                            Err(EvalError::Message("map requires a block".to_string()))
+                        }
+                    }
+                    "select" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut results = Vec::new();
+                            for val in arr_snapshot.iter() {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let cf = self.eval_block(body)?;
+                                self.stack.pop();
+                                if self.is_truthy(&cf.value()) {
+                                    results.push(val.clone());
+                                }
+                            }
+                            Ok(Value::new_array(results))
+                        } else {
+                            Err(EvalError::Message("select requires a block".to_string()))
+                        }
+                    }
+                    "reduce" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut acc = args.first().cloned().unwrap_or(Value::Nil);
+                            for val in arr_snapshot.iter() {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), acc);
+                                }
+                                if let Some(p) = params.get(1) {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let cf = self.eval_block(body)?;
+                                self.stack.pop();
+                                acc = cf.value();
+                            }
+                            Ok(acc)
+                        } else {
+                            Err(EvalError::Message("reduce requires a block".to_string()))
+                        }
+                    }
+                    "sort" => {
+                        let mut sorted = arr_snapshot.clone();
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut err = None;
+                            sorted.sort_by(|a, b| {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), a.clone());
+                                }
+                                if let Some(p) = params.get(1) {
+                                    scope.insert(p.clone(), b.clone());
+                                }
+                                self.stack.push(scope);
+                                match self.eval_block(body) {
+                                    Ok(cf) => {
+                                        self.stack.pop();
+                                        if let Some(i) = cf.value().as_int() {
+                                            if i < 0 {
+                                                std::cmp::Ordering::Less
+                                            } else if i > 0 {
+                                                std::cmp::Ordering::Greater
+                                            } else {
+                                                std::cmp::Ordering::Equal
+                                            }
+                                        } else {
+                                            std::cmp::Ordering::Equal
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.stack.pop();
+                                        err = Some(e);
+                                        std::cmp::Ordering::Equal
+                                    }
+                                }
+                            });
+                            if let Some(e) = err {
+                                return Err(e);
+                            }
+                        } else {
+                            sorted.sort_by(|a, b| {
+                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                        }
+                        Ok(Value::new_array(sorted))
+                    }
+                    "sort_by" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let sorted = arr_snapshot.clone();
+                            let mut sort_keys = Vec::new();
+                            for val in &sorted {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let res = self.eval_block(body)?;
+                                self.stack.pop();
+                                sort_keys.push(res.value());
+                            }
+                            let mut paired: Vec<(Value, Value)> =
+                                sorted.into_iter().zip(sort_keys).collect();
+                            paired.sort_by(|(_, ka), (_, kb)| {
+                                ka.partial_cmp(kb).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            Ok(Value::new_array(
+                                paired.into_iter().map(|(v, _)| v).collect(),
+                            ))
+                        } else {
+                            Err(EvalError::Message("sort_by requires a block".to_string()))
+                        }
+                    }
+                    "partition" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut left = Vec::new();
+                            let mut right = Vec::new();
+                            for val in arr_snapshot.iter() {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let res = self.eval_block(body)?;
+                                self.stack.pop();
+                                if self.is_truthy(&res.value()) {
+                                    left.push(val.clone());
+                                } else {
+                                    right.push(val.clone());
+                                }
+                            }
+                            Ok(Value::new_array(vec![
+                                Value::new_array(left),
+                                Value::new_array(right),
+                            ]))
+                        } else {
+                            Err(EvalError::Message("partition requires a block".to_string()))
+                        }
+                    }
+                    "group_by" | "group_by_stable" => {
+                        if let Some(Expr::Block { params, body }) = block {
+                            let mut groups = HashMap::new();
+                            let mut order = Vec::new();
+                            for val in arr_snapshot.iter() {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let res = self.eval_block(body)?;
+                                self.stack.pop();
+                                let key = match res.value() {
+                                    Value::String(s) | Value::Symbol(s) => s,
+                                    v => v.to_string(),
+                                };
+                                if !groups.contains_key(&key) {
+                                    groups.insert(key.clone(), Vec::new());
+                                    order.push(key.clone());
+                                }
+                                groups.get_mut(&key).unwrap().push(val.clone());
+                            }
+                            let mut res_map = HashMap::new();
+                            for k in order {
+                                res_map.insert(
+                                    k.clone(),
+                                    Value::new_array(groups.remove(&k).unwrap()),
+                                );
+                            }
+                            Ok(Value::new_hash(res_map))
+                        } else {
+                            Err(EvalError::Message("group_by requires a block".to_string()))
+                        }
+                    }
+                    "tally" => {
+                        let mut tallies = HashMap::new();
+                        for val in arr_snapshot.iter() {
+                            let key = if let Some(Expr::Block { params, body }) = block {
+                                let mut scope = HashMap::new();
+                                if let Some(p) = params.first() {
+                                    scope.insert(p.clone(), val.clone());
+                                }
+                                self.stack.push(scope);
+                                let res = self.eval_block(body)?;
+                                self.stack.pop();
+                                match res.value() {
+                                    Value::String(s) | Value::Symbol(s) => s,
+                                    v => v.to_string(),
+                                }
+                            } else {
+                                match val {
+                                    Value::String(s) | Value::Symbol(s) => s.clone(),
+                                    v => v.to_string(),
+                                }
+                            };
+                            *tallies.entry(key).or_insert(0) += 1;
+                        }
+                        let mut res_map = HashMap::new();
+                        for (k, v) in tallies {
+                            res_map.insert(k, Value::Int(v));
+                        }
+                        Ok(Value::new_hash(res_map))
+                    }
+                    "[]=" => {
+                        if args.len() < 2 {
+                            return Err(EvalError::Message(
+                                "[]= expects index and value".to_string(),
+                            ));
+                        }
+                        if let Some(i) = args[0].as_int() {
+                            let mut mut_arr = a.write().unwrap();
+                            let idx = if i < 0 { mut_arr.len() as i64 + i } else { i } as usize;
+                            if idx < mut_arr.len() {
+                                mut_arr[idx] = args[1].clone();
+                                Ok(args[1].clone())
+                            } else {
+                                return Err(EvalError::Message(format!(
+                                    "index {} out of bounds",
+                                    idx
+                                )));
+                            }
+                        } else {
+                            return Err(EvalError::Message("Array index must be int".to_string()));
+                        }
+                    }
+                    _ => Err(EvalError::Message(format!(
+                        "Method '{}' not supported for Array",
+                        method
+                    ))),
                 }
             }
-            _ => {}
-        }
 
-        match (receiver.clone(), method, block) {
+            (Value::String(s), method, _) | (Value::Symbol(s), method, _) => match method {
+                "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
+                "bytesize" => Ok(Value::Int(s.len() as i64)),
+                "empty?" => Ok(Value::Bool(s.is_empty())),
+                "ord" => {
+                    if let Some(c) = s.chars().next() {
+                        Ok(Value::Int(c as i64))
+                    } else {
+                        Err(EvalError::Message(
+                            "ord requires non-empty string".to_string(),
+                        ))
+                    }
+                }
+                "chomp" => {
+                    let sep = args.get(0).and_then(|v| v.as_str()).unwrap_or("\n");
+                    if s.ends_with(sep) {
+                        Ok(Value::String(s[..s.len() - sep.len()].to_string()))
+                    } else if sep == "\n" && s.ends_with("\r\n") {
+                        Ok(Value::String(s[..s.len() - 2].to_string()))
+                    } else {
+                        Ok(Value::String(s.clone()))
+                    }
+                }
+                "upcase" | "uppercase" => {
+                    let res = s.to_uppercase();
+                    if matches!(receiver, Value::Symbol(_)) {
+                        Ok(Value::Symbol(res))
+                    } else {
+                        Ok(Value::String(res))
+                    }
+                }
+                "downcase" | "lowercase" => {
+                    let res = s.to_lowercase();
+                    if matches!(receiver, Value::Symbol(_)) {
+                        Ok(Value::Symbol(res))
+                    } else {
+                        Ok(Value::String(res))
+                    }
+                }
+                "capitalize" => {
+                    let mut c = s.chars();
+                    let cap = match c.next() {
+                        None => String::new(),
+                        Some(f) => {
+                            f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
+                        }
+                    };
+                    if matches!(receiver, Value::Symbol(_)) {
+                        Ok(Value::Symbol(cap))
+                    } else {
+                        Ok(Value::String(cap))
+                    }
+                }
+                "swapcase" => {
+                    let res: String = s
+                        .chars()
+                        .map(|c| {
+                            if c.is_uppercase() {
+                                c.to_lowercase().next().unwrap()
+                            } else {
+                                c.to_uppercase().next().unwrap()
+                            }
+                        })
+                        .collect();
+                    if matches!(receiver, Value::Symbol(_)) {
+                        Ok(Value::Symbol(res))
+                    } else {
+                        Ok(Value::String(res))
+                    }
+                }
+                "reverse" => {
+                    let res: String = s.chars().rev().collect();
+                    if matches!(receiver, Value::Symbol(_)) {
+                        Ok(Value::Symbol(res))
+                    } else {
+                        Ok(Value::String(res))
+                    }
+                }
+                "strip!" => {
+                    if let Value::Symbol(_) = receiver {
+                        return Err(EvalError::Message("Cannot mutate symbol".to_string()));
+                    }
+                    let res = s.trim();
+                    if res == s {
+                        Ok(Value::Nil)
+                    } else {
+                        Ok(Value::String(res.to_string()))
+                    }
+                }
+                "upcase!" | "uppercase!" => {
+                    let res = s.to_uppercase();
+                    if res == s {
+                        Ok(Value::Nil)
+                    } else {
+                        Ok(Value::String(res))
+                    }
+                }
+                "downcase!" | "lowercase!" => {
+                    let res = s.to_lowercase();
+                    if res == s {
+                        Ok(Value::Nil)
+                    } else {
+                        Ok(Value::String(res))
+                    }
+                }
+                "capitalize!" => {
+                    let mut c = s.chars();
+                    let cap = match c.next() {
+                        None => String::new(),
+                        Some(f) => {
+                            f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
+                        }
+                    };
+                    if cap == s {
+                        Ok(Value::Nil)
+                    } else {
+                        Ok(Value::String(cap))
+                    }
+                }
+                "swapcase!" => {
+                    let res: String = s
+                        .chars()
+                        .map(|c| {
+                            if c.is_uppercase() {
+                                c.to_lowercase().next().unwrap()
+                            } else {
+                                c.to_uppercase().next().unwrap()
+                            }
+                        })
+                        .collect();
+                    if res == s {
+                        Ok(Value::Nil)
+                    } else {
+                        Ok(Value::String(res))
+                    }
+                }
+                "reverse!" => {
+                    let res: String = s.chars().rev().collect();
+                    if res == s {
+                        Ok(Value::Nil)
+                    } else {
+                        Ok(Value::String(res))
+                    }
+                }
+                "match" => {
+                    if let Some(Value::String(pattern)) = args.first() {
+                        let re = Regex::new(pattern)
+                            .map_err(|e| EvalError::Message(format!("invalid regex: {}", e)))?;
+                        if let Some(caps) = re.captures(&s) {
+                            let groups: Vec<Value> = caps
+                                .iter()
+                                .map(|m| {
+                                    m.map_or(Value::Nil, |mat| {
+                                        Value::String(mat.as_str().to_string())
+                                    })
+                                })
+                                .collect();
+                            Ok(Value::new_array(groups))
+                        } else {
+                            Ok(Value::Nil)
+                        }
+                    } else {
+                        Err(EvalError::Message(
+                            "match expects a regex pattern".to_string(),
+                        ))
+                    }
+                }
+                "scan" => {
+                    if let Some(Value::String(pattern)) = args.first() {
+                        let re = Regex::new(pattern)
+                            .map_err(|e| EvalError::Message(format!("invalid regex: {}", e)))?;
+                        let matches: Vec<Value> = re
+                            .find_iter(&s)
+                            .map(|m| Value::String(m.as_str().to_string()))
+                            .collect();
+                        Ok(Value::new_array(matches))
+                    } else {
+                        Err(EvalError::Message(
+                            "scan expects a regex pattern".to_string(),
+                        ))
+                    }
+                }
+                "index" => {
+                    if let Some(Value::String(sub)) = args.first() {
+                        let offset = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+                        let runes: Vec<char> = s.chars().collect();
+                        if offset >= runes.len() {
+                            return Ok(Value::Nil);
+                        }
+                        let search_str: String = runes[offset..].iter().collect();
+                        if let Some(idx) = search_str.find(sub) {
+                            let char_idx = search_str[..idx].chars().count();
+                            return Ok(Value::Int((offset + char_idx) as i64));
+                        }
+                    }
+                    Ok(Value::Nil)
+                }
+                "rindex" => {
+                    if let Some(Value::String(sub)) = args.first() {
+                        let runes: Vec<char> = s.chars().collect();
+                        let offset =
+                            args.get(1)
+                                .and_then(|v| v.as_int())
+                                .unwrap_or(runes.len() as i64) as usize;
+                        let limit = if offset > runes.len() {
+                            runes.len()
+                        } else {
+                            offset
+                        };
+                        let search_str: String = runes[..limit].iter().collect();
+                        if let Some(idx) = search_str.rfind(sub) {
+                            let char_idx = search_str[..idx].chars().count();
+                            return Ok(Value::Int(char_idx as i64));
+                        }
+                    }
+                    Ok(Value::Nil)
+                }
+                "start_with?" | "starts_with?" => {
+                    if let Some(Value::String(pre)) = args.first() {
+                        Ok(Value::Bool(s.starts_with(pre)))
+                    } else {
+                        Ok(Value::Bool(false))
+                    }
+                }
+                "end_with?" | "ends_with?" => {
+                    if let Some(Value::String(suf)) = args.first() {
+                        Ok(Value::Bool(s.ends_with(suf)))
+                    } else {
+                        Ok(Value::Bool(false))
+                    }
+                }
+                "contains?" | "include?" => {
+                    if let Some(Value::String(sub)) = args.first() {
+                        Ok(Value::Bool(s.contains(sub)))
+                    } else {
+                        Ok(Value::Bool(false))
+                    }
+                }
+                "lstrip" => Ok(Value::String(s.trim_start().to_string())),
+                "rstrip" => Ok(Value::String(s.trim_end().to_string())),
+                "strip" => Ok(Value::String(s.trim().to_string())),
+                "replace" => {
+                    if let (Some(Value::String(old)), Some(Value::String(new))) =
+                        (args.get(0), args.get(1))
+                    {
+                        Ok(Value::String(s.replace(old, new)))
+                    } else {
+                        Ok(Value::String(s.clone()))
+                    }
+                }
+                "delete_prefix" => {
+                    if let Some(Value::String(pre)) = args.first() {
+                        Ok(Value::String(s.strip_prefix(pre).unwrap_or(&s).to_string()))
+                    } else {
+                        Ok(Value::String(s.clone()))
+                    }
+                }
+                "delete_suffix" => {
+                    if let Some(Value::String(suf)) = args.first() {
+                        Ok(Value::String(s.strip_suffix(suf).unwrap_or(&s).to_string()))
+                    } else {
+                        Ok(Value::String(s.clone()))
+                    }
+                }
+                "clear" => Ok(Value::String(String::new())),
+                "concat" => {
+                    let mut res = s.clone();
+                    for arg in args {
+                        res.push_str(&arg.to_string());
+                    }
+                    Ok(Value::String(res))
+                }
+                "chr" => {
+                    if let Some(c) = s.chars().next() {
+                        Ok(Value::String(c.to_string()))
+                    } else {
+                        Ok(Value::String(String::new()))
+                    }
+                }
+                "split" => {
+                    let sep = args.get(0).and_then(|v| v.as_str());
+                    let parts = if let Some(s_sep) = sep {
+                        if s_sep.is_empty() {
+                            s.chars().map(|c| Value::String(c.to_string())).collect()
+                        } else {
+                            s.split(s_sep)
+                                .map(|p| Value::String(p.to_string()))
+                                .collect()
+                        }
+                    } else {
+                        s.split_whitespace()
+                            .map(|p| Value::String(p.to_string()))
+                            .collect()
+                    };
+                    Ok(Value::new_array(parts))
+                }
+                "sub" | "sub!" | "gsub" | "gsub!" => {
+                    let pattern = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                    let replacement = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                    let is_regex = kwargs
+                        .get("regex")
+                        .map(|v| self.is_truthy(v))
+                        .unwrap_or(false);
+                    let all = method.contains("gsub");
+                    let result = if is_regex {
+                        let re =
+                            Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                        if all {
+                            re.replace_all(&s, replacement).to_string()
+                        } else {
+                            re.replace(&s, replacement).to_string()
+                        }
+                    } else {
+                        if all {
+                            s.replace(pattern, replacement)
+                        } else {
+                            s.replacen(pattern, replacement, 1)
+                        }
+                    };
+                    if method.ends_with('!') {
+                        if result == s {
+                            Ok(Value::Nil)
+                        } else {
+                            Ok(Value::String(result))
+                        }
+                    } else {
+                        Ok(Value::String(result))
+                    }
+                }
+                "slice" => {
+                    let chars: Vec<char> = s.chars().collect();
+                    if args.len() == 1 {
+                        if let Some(i) = args[0].as_int() {
+                            let idx = if i < 0 { chars.len() as i64 + i } else { i } as usize;
+                            Ok(chars
+                                .get(idx)
+                                .map_or(Value::Nil, |c| Value::String(c.to_string())))
+                        } else {
+                            Ok(Value::Nil)
+                        }
+                    } else if args.len() >= 2 {
+                        if let (Some(start), Some(len)) = (args[0].as_int(), args[1].as_int()) {
+                            let start_idx = if start < 0 {
+                                chars.len() as i64 + start
+                            } else {
+                                start
+                            } as usize;
+                            let end_idx = (start_idx + len as usize).min(chars.len());
+                            if start_idx >= chars.len() {
+                                Ok(Value::Nil)
+                            } else {
+                                Ok(Value::String(chars[start_idx..end_idx].iter().collect()))
+                            }
+                        } else {
+                            Ok(Value::Nil)
+                        }
+                    } else {
+                        Ok(Value::Nil)
+                    }
+                }
+                "squish" | "squish!" => {
+                    let res = Regex::new(r"\s+")
+                        .unwrap()
+                        .replace_all(s.trim(), " ")
+                        .to_string();
+                    if method.ends_with('!') {
+                        if res == s {
+                            Ok(Value::Nil)
+                        } else {
+                            Ok(Value::String(res))
+                        }
+                    } else {
+                        Ok(Value::String(res))
+                    }
+                }
+                "template" => {
+                    let mut result = s.clone();
+                    if let Some(Value::Hash(h)) = args.first() {
+                        let hash = h.read().unwrap();
+                        let re = Regex::new(r"\{\{([a-zA-Z0-9_\.]+)\}\}").unwrap();
+                        let mut replaced = result.clone();
+                        for cap in re.captures_iter(&result) {
+                            let full_match = &cap[0];
+                            let key_path = &cap[1];
+                            let mut current_val = Value::Nil;
+                            let mut found = false;
+                            let parts: Vec<&str> = key_path.split('.').collect();
+                            if let Some(first_key) = parts.first() {
+                                if let Some(val) = hash.get(*first_key) {
+                                    current_val = val.clone();
+                                    found = true;
+                                    for part in parts.iter().skip(1) {
+                                        let next_val = if let Value::Hash(ref inner_h) = current_val
+                                        {
+                                            inner_h.read().unwrap().get(*part).cloned()
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(v) = next_val {
+                                            current_val = v;
+                                        } else {
+                                            found = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if found && !current_val.is_nil() {
+                                replaced = replaced.replace(full_match, &current_val.to_string());
+                            }
+                        }
+                        result = replaced;
+                    }
+                    Ok(Value::String(result))
+                }
+                _ => Err(EvalError::Message(format!(
+                    "Method '{}' not supported for String",
+                    method
+                ))),
+            },
+
+            (Value::Int(i), method, block) => match method {
+                "seconds" | "second" => Ok(Value::Duration(i)),
+                "minutes" | "minute" => Ok(Value::Duration(i * 60)),
+                "hours" | "hour" => Ok(Value::Duration(i * 3600)),
+                "days" | "day" => Ok(Value::Duration(i * 86400)),
+                "weeks" | "week" => Ok(Value::Duration(i * 86400 * 7)),
+                "abs" => Ok(Value::Int(i.abs())),
+                "even?" => Ok(Value::Bool(i % 2 == 0)),
+                "odd?" => Ok(Value::Bool(i % 2 != 0)),
+                "clamp" => {
+                    if args.len() != 2 {
+                        return Err(EvalError::Message("clamp expects min and max".to_string()));
+                    }
+                    let min = args[0]
+                        .as_int()
+                        .ok_or_else(|| EvalError::Message("min must be int".to_string()))?;
+                    let max = args[1]
+                        .as_int()
+                        .ok_or_else(|| EvalError::Message("max must be int".to_string()))?;
+                    Ok(Value::Int(i.clamp(min, max)))
+                }
+                "times" => {
+                    if let Some(Expr::Block { params, body }) = block {
+                        for idx in 0..i {
+                            let mut scope = HashMap::new();
+                            if let Some(p) = params.first() {
+                                scope.insert(p.clone(), Value::Int(idx));
+                            }
+                            self.stack.push(scope);
+                            let cf = self.eval_block(body)?;
+                            self.stack.pop();
+                            if !cf.is_continue() {
+                                if matches!(cf, ControlFlow::Break(_)) {
+                                    break;
+                                }
+                                return Ok(cf.value());
+                            }
+                        }
+                        Ok(Value::Int(i))
+                    } else {
+                        Err(EvalError::Message("times requires a block".to_string()))
+                    }
+                }
+                _ => Err(EvalError::Message(format!("unknown int member {}", method))),
+            },
+
+            (Value::Float(f), method, _) => match method {
+                "abs" => Ok(Value::Float(f.abs())),
+                "round" => Ok(Value::Int(f.round() as i64)),
+                "floor" => Ok(Value::Int(f.floor() as i64)),
+                "ceil" => Ok(Value::Int(f.ceil() as i64)),
+                "clamp" => {
+                    if args.len() != 2 {
+                        return Err(EvalError::Message("clamp expects min and max".to_string()));
+                    }
+                    let min = args[0]
+                        .as_float()
+                        .or_else(|| args[0].as_int().map(|i| i as f64))
+                        .ok_or_else(|| EvalError::Message("min must be numeric".to_string()))?;
+                    let max = args[1]
+                        .as_float()
+                        .or_else(|| args[1].as_int().map(|i| i as f64))
+                        .ok_or_else(|| EvalError::Message("max must be numeric".to_string()))?;
+                    Ok(Value::Float(f.clamp(min, max)))
+                }
+                _ => Err(EvalError::Message(format!(
+                    "unknown float member {}",
+                    method
+                ))),
+            },
+
+            (Value::Money { cents, currency }, method, _) => match method {
+                "cents" => Ok(Value::Int(cents)),
+                "currency" => Ok(Value::String(currency)),
+                "format" => Ok(Value::String(format!(
+                    "{:.2} {}",
+                    cents as f64 / 100.0,
+                    currency
+                ))),
+                _ => Err(EvalError::Message(format!(
+                    "unknown money member {}",
+                    method
+                ))),
+            },
+
+            (Value::Duration(s), method, _) => match method {
+                "seconds" | "to_i" => Ok(Value::Int(s)),
+                "iso8601" => {
+                    let h = s / 3600;
+                    let m = (s % 3600) / 60;
+                    let sec = s % 60;
+                    let mut res = "PT".to_string();
+                    if h > 0 {
+                        res.push_str(&format!("{}H", h));
+                    }
+                    if m > 0 {
+                        res.push_str(&format!("{}M", m));
+                    }
+                    if sec > 0 || (h == 0 && m == 0) {
+                        res.push_str(&format!("{}S", sec));
+                    }
+                    Ok(Value::String(res))
+                }
+                "in_hours" => Ok(Value::Float(s as f64 / 3600.0)),
+                "parts" => {
+                    let mut parts = HashMap::new();
+                    parts.insert("hours".to_string(), Value::Int(s / 3600));
+                    parts.insert("minutes".to_string(), Value::Int((s % 3600) / 60));
+                    parts.insert("seconds".to_string(), Value::Int(s % 60));
+                    Ok(Value::new_hash(parts))
+                }
+                "ago" | "before" | "until" => {
+                    let anchor = args
+                        .first()
+                        .and_then(|v| match v {
+                            Value::Time(t) => Some(*t),
+                            _ => None,
+                        })
+                        .unwrap_or(Utc::now());
+                    let d = chrono::Duration::seconds(s);
+                    Ok(Value::Time(anchor - d))
+                }
+                "after" | "since" | "from_now" => {
+                    let anchor = args
+                        .first()
+                        .and_then(|v| match v {
+                            Value::Time(t) => Some(*t),
+                            _ => None,
+                        })
+                        .unwrap_or(Utc::now());
+                    let d = chrono::Duration::seconds(s);
+                    Ok(Value::Time(anchor + d))
+                }
+                _ => Err(EvalError::Message(format!(
+                    "unknown duration member {}",
+                    method
+                ))),
+            },
+
+            (Value::Time(t), method, _) => match method {
+                "format" => {
+                    let fmt = args
+                        .get(0)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("%Y-%m-%dT%H:%M:%S%Z");
+                    let rust_fmt = match fmt {
+                        "2006-01-02T15:04:05Z07:00" => "%Y-%m-%dT%H:%M:%S%Z",
+                        "15:04:05" => "%H:%M:%S",
+                        "2006-01-02" => "%Y-%m-%d",
+                        _ => fmt,
+                    };
+                    let mut res = t.format(rust_fmt).to_string();
+                    if fmt == "15:04:05" {
+                        res.push_str("UTC");
+                    }
+                    Ok(Value::String(res))
+                }
+                "year" => Ok(Value::Int(t.year() as i64)),
+                "month" => Ok(Value::Int(t.month() as i64)),
+                "day" => Ok(Value::Int(t.day() as i64)),
+                "hour" => Ok(Value::Int(t.hour() as i64)),
+                "minute" => Ok(Value::Int(t.minute() as i64)),
+                "second" => Ok(Value::Int(t.second() as i64)),
+                _ => Err(EvalError::Message(format!(
+                    "unknown time member {}",
+                    method
+                ))),
+            },
+
             (Value::Instance(inst), method, _) => {
                 let class = inst.read().unwrap().class.clone();
                 if let Some(f) = class.methods.read().unwrap().get(method).cloned() {
@@ -1169,580 +2554,9 @@ impl Engine {
                 Ok(Value::Symbol(variant_name.to_lowercase()))
             }
 
-            (Value::Time(t), "format", _) => {
-                if let Some(Value::String(fmt)) = args.first() {
-                    let rust_fmt = match fmt.as_str() {
-                        "2006-01-02T15:04:05Z07:00" => "%Y-%m-%dT%H:%M:%S%Z",
-                        _ => fmt,
-                    };
-                    return Ok(Value::String(t.format(rust_fmt).to_string()));
-                }
-                Ok(Value::String(t.to_rfc3339()))
-            }
-
-            (Value::Duration(s), method, _) => {
-                if method == "seconds" || method == "to_i" {
-                    return Ok(Value::Int(s));
-                } else if method == "iso8601" {
-                    let h = s / 3600;
-                    let m = (s % 3600) / 60;
-                    let sec = s % 60;
-                    let mut res = "PT".to_string();
-                    if h > 0 {
-                        res.push_str(&format!("{}H", h));
-                    }
-                    if m > 0 {
-                        res.push_str(&format!("{}M", m));
-                    }
-                    if sec > 0 || (h == 0 && m == 0) {
-                        res.push_str(&format!("{}S", sec));
-                    }
-                    return Ok(Value::String(res));
-                } else if method == "in_hours" {
-                    return Ok(Value::Float(s as f64 / 3600.0));
-                } else if method == "parts" {
-                    let mut parts = HashMap::new();
-                    parts.insert("hours".to_string(), Value::Int(s / 3600));
-                    parts.insert("minutes".to_string(), Value::Int((s % 3600) / 60));
-                    parts.insert("seconds".to_string(), Value::Int(s % 60));
-                    return Ok(Value::new_hash(parts));
-                }
-                Err(EvalError::Message(format!(
-                    "Method '{}' not supported for Duration",
-                    method
-                )))
-            }
-
-            (Value::Int(i), "minutes", _) => Ok(Value::Duration(i * 60)),
-            (Value::Int(i), "hours", _) => Ok(Value::Duration(i * 3600)),
-            (Value::Int(i), "days", _) => Ok(Value::Duration(i * 86400)),
-            (Value::Int(i), "seconds", _) => Ok(Value::Duration(i)),
-
-            (Value::Float(f), "minutes", _) => Ok(Value::Duration((f * 60.0) as i64)),
-            (Value::Float(f), "hours", _) => Ok(Value::Duration((f * 3600.0) as i64)),
-            (Value::Float(f), "days", _) => Ok(Value::Duration((f * 86400.0) as i64)),
-            (Value::Float(f), "seconds", _) => Ok(Value::Duration(f as i64)),
-
-            (Value::Hash(h), "[]=", _) => {
-                if args.len() < 2 {
-                    return Err(EvalError::Message(
-                        "[]= expects a key and a value".to_string(),
-                    ));
-                }
-                let key_val = &args[0];
-                let new_val = &args[1];
-                if let Value::String(s) = key_val {
-                    let mut hash = h.write().unwrap();
-                    hash.insert(s.clone(), new_val.clone());
-                    Ok(new_val.clone())
-                } else {
-                    Err(EvalError::Message("Hash key must be a string".to_string()))
-                }
-            }
+            (Value::Function(f), "call", _) => self.call_function_def(&f, args, block),
 
             (_, "to_string", _) => Ok(Value::String(receiver.to_string())),
-
-            (Value::String(s), "length" | "size", _) => Ok(Value::Int(s.chars().count() as i64)),
-            (Value::String(s), "uppercase" | "upcase", _) => Ok(Value::String(s.to_uppercase())),
-            (Value::String(s), "lowercase" | "downcase", _) => Ok(Value::String(s.to_lowercase())),
-            (Value::String(s), "capitalize", _) => {
-                let mut c = s.chars();
-                match c.next() {
-                    None => Ok(Value::String(String::new())),
-                    Some(f) => Ok(Value::String(
-                        f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
-                    )),
-                }
-            }
-            (Value::String(s), "swapcase", _) => {
-                let swapped = s
-                    .chars()
-                    .map(|c| {
-                        if c.is_uppercase() {
-                            c.to_lowercase().to_string()
-                        } else {
-                            c.to_uppercase().to_string()
-                        }
-                    })
-                    .collect::<String>();
-                Ok(Value::String(swapped))
-            }
-            (Value::String(s), "reverse", _) => {
-                Ok(Value::String(s.chars().rev().collect::<String>()))
-            }
-            (Value::String(s), "empty?", _) => Ok(Value::Bool(s.is_empty())),
-            (Value::String(s), "start_with?" | "starts_with?", _) => {
-                if let Some(Value::String(prefix)) = args.first() {
-                    Ok(Value::Bool(s.starts_with(prefix)))
-                } else {
-                    Ok(Value::Bool(false))
-                }
-            }
-            (Value::String(s), "end_with?" | "ends_with?", _) => {
-                if let Some(Value::String(suffix)) = args.first() {
-                    Ok(Value::Bool(s.ends_with(suffix)))
-                } else {
-                    Ok(Value::Bool(false))
-                }
-            }
-            (Value::String(s), "contains?" | "include?", _) => {
-                if let Some(Value::String(sub)) = args.first() {
-                    Ok(Value::Bool(s.contains(sub)))
-                } else {
-                    Ok(Value::Bool(false))
-                }
-            }
-            (Value::String(s), "lstrip", _) => Ok(Value::String(s.trim_start().to_string())),
-            (Value::String(s), "rstrip", _) => Ok(Value::String(s.trim_end().to_string())),
-            (Value::String(s), "strip!", _) => {
-                let trimmed = s.trim();
-                if trimmed == s {
-                    Ok(Value::Nil)
-                } else {
-                    Ok(Value::String(trimmed.to_string()))
-                }
-            }
-            (Value::String(s), "strip", _) => Ok(Value::String(s.trim().to_string())),
-            (Value::String(s), "replace", _) => {
-                if let Some(new_val) = args.first() {
-                    Ok(Value::String(new_val.to_string()))
-                } else {
-                    Ok(Value::String(s.clone()))
-                }
-            }
-            (Value::String(s), "delete_prefix", _) => {
-                if let Some(Value::String(prefix)) = args.first() {
-                    let result = s.strip_prefix(prefix).unwrap_or(&s).to_string();
-                    if result == s {
-                        Ok(Value::String(s.clone()))
-                    } else {
-                        Ok(Value::String(result))
-                    }
-                } else {
-                    Ok(Value::String(s.clone()))
-                }
-            }
-            (Value::String(s), "delete_suffix", _) => {
-                if let Some(Value::String(suffix)) = args.first() {
-                    let result = s.strip_suffix(suffix).unwrap_or(&s).to_string();
-                    if result == s {
-                        Ok(Value::String(s.clone()))
-                    } else {
-                        Ok(Value::String(result))
-                    }
-                } else {
-                    Ok(Value::String(s.clone()))
-                }
-            }
-            (Value::String(_), "clear", _) => Ok(Value::String(String::new())),
-            (Value::String(s), "concat", _) => {
-                let mut result = s.clone();
-                for arg in args {
-                    result.push_str(&arg.to_string());
-                }
-                Ok(Value::String(result))
-            }
-            (Value::String(s), "bytesize", _) => Ok(Value::Int(s.len() as i64)),
-            (Value::String(s), "ord", _) => {
-                if let Some(c) = s.chars().next() {
-                    Ok(Value::Int(c as i64))
-                } else {
-                    Err(EvalError::Message("empty string".to_string()))
-                }
-            }
-            (Value::String(s), "chr", _) => {
-                if let Some(c) = s.chars().next() {
-                    Ok(Value::String(c.to_string()))
-                } else {
-                    Ok(Value::String(String::new()))
-                }
-            }
-            (Value::String(s), "split", _) => {
-                let sep = if let Some(Value::String(sep)) = args.first() {
-                    Some(sep.as_str())
-                } else {
-                    None
-                };
-
-                let parts = if let Some(sep) = sep {
-                    if sep.is_empty() {
-                        s.chars().map(|c| Value::String(c.to_string())).collect()
-                    } else {
-                        s.split(sep)
-                            .map(|part| Value::String(part.to_string()))
-                            .collect()
-                    }
-                } else {
-                    s.split_whitespace()
-                        .map(|part| Value::String(part.to_string()))
-                        .collect()
-                };
-                Ok(Value::new_array(parts))
-            }
-            (Value::String(s), "index", _) => {
-                if let Some(Value::String(sub)) = args.first() {
-                    if let Some(idx) = s.find(sub) {
-                        // Use character index for UTF-8 compatibility
-                        let char_idx = s[..idx].chars().count();
-                        Ok(Value::Int(char_idx as i64))
-                    } else {
-                        Ok(Value::Nil)
-                    }
-                } else {
-                    Ok(Value::Nil)
-                }
-            }
-            (Value::String(s), "rindex", _) => {
-                if let Some(Value::String(sub)) = args.first() {
-                    if let Some(idx) = s.rfind(sub) {
-                        // Use character index for UTF-8 compatibility
-                        let char_idx = s[..idx].chars().count();
-                        Ok(Value::Int(char_idx as i64))
-                    } else {
-                        Ok(Value::Nil)
-                    }
-                } else {
-                    Ok(Value::Nil)
-                }
-            }
-            (Value::String(s), "sub" | "sub!" | "gsub" | "gsub!", _) => {
-                let pattern = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
-                let replacement = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-                let is_regex = kwargs
-                    .get("regex")
-                    .map(|v| self.is_truthy(v))
-                    .unwrap_or(false);
-                let all = method.contains("gsub");
-
-                let result = if is_regex {
-                    let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
-                    if all {
-                        re.replace_all(&s, replacement).to_string()
-                    } else {
-                        re.replace(&s, replacement).to_string()
-                    }
-                } else {
-                    if all {
-                        s.replace(pattern, replacement)
-                    } else {
-                        s.replacen(pattern, replacement, 1)
-                    }
-                };
-
-                if method.ends_with('!') {
-                    if result == s {
-                        Ok(Value::Nil)
-                    } else {
-                        Ok(Value::String(result))
-                    }
-                } else {
-                    Ok(Value::String(result))
-                }
-            }
-            (Value::String(s), "match", _) => {
-                let pattern = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
-                let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
-                if let Some(caps) = re.captures(&s) {
-                    let groups: Vec<Value> = caps
-                        .iter()
-                        .map(|m| {
-                            m.map_or(Value::Nil, |mat| Value::String(mat.as_str().to_string()))
-                        })
-                        .collect();
-                    Ok(Value::new_array(groups))
-                } else {
-                    Ok(Value::Nil)
-                }
-            }
-            (Value::String(s), "scan", _) => {
-                let pattern = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
-                let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
-                let matches: Vec<Value> = re
-                    .find_iter(&s)
-                    .map(|mat| Value::String(mat.as_str().to_string()))
-                    .collect();
-                Ok(Value::new_array(matches))
-            }
-            (Value::String(s), "slice", _) => {
-                let chars: Vec<char> = s.chars().collect();
-                if args.len() == 1 {
-                    if let Value::Int(i) = args[0] {
-                        let idx = if i < 0 { chars.len() as i64 + i } else { i } as usize;
-                        Ok(chars
-                            .get(idx)
-                            .map_or(Value::Nil, |c| Value::String(c.to_string())))
-                    } else {
-                        Ok(Value::Nil)
-                    }
-                } else if args.len() >= 2 {
-                    if let (Value::Int(start), Value::Int(len)) = (&args[0], &args[1]) {
-                        let start_idx = if *start < 0 {
-                            chars.len() as i64 + *start
-                        } else {
-                            *start
-                        } as usize;
-                        let end_idx = (start_idx + (*len as usize)).min(chars.len());
-                        if start_idx >= chars.len() {
-                            Ok(Value::Nil)
-                        } else {
-                            let sub: String = chars[start_idx..end_idx].iter().collect();
-                            Ok(Value::String(sub))
-                        }
-                    } else {
-                        Ok(Value::Nil)
-                    }
-                } else {
-                    Ok(Value::Nil)
-                }
-            }
-            (Value::String(s), "squish!", _) => {
-                let re = Regex::new(r"\s+").unwrap();
-                let squished = re.replace_all(s.trim(), " ").to_string();
-                if squished == s {
-                    Ok(Value::Nil)
-                } else {
-                    Ok(Value::String(squished))
-                }
-            }
-            (Value::String(s), "squish", _) => {
-                let re = Regex::new(r"\s+").unwrap();
-                let squished = re.replace_all(s.trim(), " ").to_string();
-                Ok(Value::String(squished))
-            }
-            (Value::String(s), "chomp", _) => {
-                let suffix = args.get(0).and_then(|v| v.as_str()).unwrap_or("\n");
-                Ok(Value::String(
-                    s.strip_suffix(suffix).unwrap_or(&s).to_string(),
-                ))
-            }
-            (Value::String(s), "template", _) => {
-                let mut result = s.clone();
-                if let Some(Value::Hash(h)) = args.first() {
-                    let hash = h.read().unwrap();
-                    // Basic implementation for {{key}} and {{nested.key}}
-                    let re = Regex::new(r"\{\{([a-zA-Z0-9_\.]+)\}\}").unwrap();
-
-                    let mut replaced = result.clone();
-                    for cap in re.captures_iter(&result) {
-                        let full_match = &cap[0];
-                        let key_path = &cap[1];
-
-                        let mut current_val = Value::Nil;
-                        let mut found = false;
-
-                        // Handle nested keys like user.name
-                        let parts: Vec<&str> = key_path.split('.').collect();
-                        if let Some(first_key) = parts.first() {
-                            if let Some(val) = hash.get(*first_key) {
-                                current_val = val.clone();
-                                found = true;
-                                for part in parts.iter().skip(1) {
-                                    let next_val = if let Value::Hash(ref inner_h) = current_val {
-                                        inner_h.read().unwrap().get(*part).cloned()
-                                    } else {
-                                        None
-                                    };
-
-                                    if let Some(v) = next_val {
-                                        current_val = v;
-                                    } else {
-                                        found = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if found && !current_val.is_nil() {
-                            replaced = replaced.replace(full_match, &current_val.to_string());
-                        }
-                    }
-                    result = replaced;
-                }
-                Ok(Value::String(result))
-            }
-
-            (Value::Array(a), "push", _) => {
-                let mut arr = a.write().unwrap();
-                for arg in args {
-                    arr.push(arg);
-                }
-                drop(arr);
-                Ok(Value::Array(a.clone()))
-            }
-            (Value::Array(a), "pop", _) => {
-                let mut arr = a.write().unwrap();
-                let val = arr.pop().unwrap_or(Value::Nil);
-                drop(arr);
-                Ok(val)
-            }
-            (Value::Array(a), "include?" | "contains?", _) => {
-                if let Some(target) = args.first() {
-                    let arr = a.read().unwrap();
-                    Ok(Value::Bool(arr.contains(target)))
-                } else {
-                    Ok(Value::Bool(false))
-                }
-            }
-            (Value::Array(a), "join", _) => {
-                let sep = if let Some(Value::String(s)) = args.first() {
-                    s.clone()
-                } else {
-                    "".to_string()
-                };
-                let arr = a.read().unwrap();
-                let joined = arr
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(&sep);
-                Ok(Value::String(joined))
-            }
-            (Value::Array(a), "map", Some(Expr::Block { params, body })) => {
-                let arr = a.read().unwrap().clone();
-                let mut results = Vec::new();
-                for val in arr {
-                    let mut scope = HashMap::new();
-                    if let Some(p) = params.first() {
-                        scope.insert(p.clone(), val);
-                    }
-                    self.stack.push(scope);
-                    let cf = self.eval_block(body)?;
-                    self.stack.pop();
-                    results.push(cf.value());
-                }
-                Ok(Value::new_array(results))
-            }
-            (Value::Array(a), "select", Some(Expr::Block { params, body })) => {
-                let arr = a.read().unwrap().clone();
-                let mut results = Vec::new();
-                for val in arr {
-                    let mut scope = HashMap::new();
-                    if let Some(p) = params.first() {
-                        scope.insert(p.clone(), val.clone());
-                    }
-                    self.stack.push(scope);
-                    let cf = self.eval_block(body)?;
-                    self.stack.pop();
-                    if self.is_truthy(&cf.value()) {
-                        results.push(val);
-                    }
-                }
-                Ok(Value::new_array(results))
-            }
-            (Value::Array(a), "reduce", Some(Expr::Block { params, body })) => {
-                let mut acc = args.first().cloned().unwrap_or(Value::Nil);
-                let arr = a.read().unwrap().clone();
-                for val in arr {
-                    let mut scope = HashMap::new();
-                    if let Some(p) = params.first() {
-                        scope.insert(p.clone(), acc);
-                    }
-                    if let Some(p) = params.get(1) {
-                        scope.insert(p.clone(), val);
-                    }
-                    self.stack.push(scope);
-                    let cf = self.eval_block(body)?;
-                    self.stack.pop();
-                    acc = cf.value();
-                }
-                Ok(acc)
-            }
-
-            (Value::Array(a), "[]=", _) => {
-                if args.len() < 2 {
-                    return Err(EvalError::Message(
-                        "[]= expects an index and a value".to_string(),
-                    ));
-                }
-                let idx_val = &args[0];
-                let new_val = &args[1];
-                if let Value::Int(i) = idx_val {
-                    let mut arr = a.write().unwrap();
-                    let idx = if *i < 0 { arr.len() as i64 + i } else { *i };
-                    if idx < 0 || idx >= arr.len() as i64 {
-                        return Err(EvalError::Message(format!(
-                            "Array index {} out of bounds (length {})",
-                            i,
-                            arr.len()
-                        )));
-                    }
-                    arr[idx as usize] = new_val.clone();
-                    Ok(new_val.clone())
-                } else {
-                    Err(EvalError::Message(
-                        "Array index must be an integer".to_string(),
-                    ))
-                }
-            }
-
-            (Value::Array(a), "each", Some(Expr::Block { params, body })) => {
-                let arr = a.read().unwrap().clone();
-                for val in arr {
-                    let mut scope = HashMap::new();
-                    if let Some(p) = params.first() {
-                        scope.insert(p.clone(), val);
-                    }
-                    self.stack.push(scope);
-                    let cf = self.eval_block(body)?;
-                    self.stack.pop();
-                    if !cf.is_continue() {
-                        if matches!(cf, ControlFlow::Break(_)) {
-                            break;
-                        }
-                        return Ok(cf.value());
-                    }
-                }
-                Ok(Value::Array(a))
-            }
-
-            (Value::Hash(h), "keys", _) => {
-                let hash = h.read().unwrap();
-                let mut keys: Vec<Value> = hash.keys().map(|k| Value::String(k.clone())).collect();
-                keys.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
-                Ok(Value::new_array(keys))
-            }
-            (Value::Hash(h), "values", _) => {
-                let hash = h.read().unwrap();
-                let values: Vec<Value> = hash.values().cloned().collect();
-                Ok(Value::new_array(values))
-            }
-            (Value::Hash(h), "length" | "size", _) => {
-                let hash = h.read().unwrap();
-                Ok(Value::Int(hash.len() as i64))
-            }
-            (Value::Hash(h), "merge", _) => {
-                if let Some(Value::Hash(other)) = args.first() {
-                    let h1 = h.read().unwrap();
-                    let h2 = other.read().unwrap();
-                    let mut new_hash = h1.clone();
-                    for (k, v) in h2.iter() {
-                        new_hash.insert(k.clone(), v.clone());
-                    }
-                    Ok(Value::new_hash(new_hash))
-                } else {
-                    Err(EvalError::Message("merge expects a hash".to_string()))
-                }
-            }
-            (Value::Hash(h), method, _) => {
-                let val = {
-                    let hash = h.read().unwrap();
-                    hash.get(method).cloned()
-                };
-                if let Some(val) = val {
-                    if let Value::Function(f) = val {
-                        return self.call_function_def(&f, args, block);
-                    }
-                    Ok(val)
-                } else {
-                    Err(EvalError::Message(format!(
-                        "Method '{}' not supported for Hash and key not found",
-                        method
-                    )))
-                }
-            }
-
-            (Value::Function(f), "call", _) => self.call_function_def(&f, args, block),
 
             _ => Err(EvalError::Message(format!(
                 "Method '{}' not supported for this type",
@@ -1910,6 +2724,40 @@ impl Engine {
                 let mut new_arr = l.clone();
                 new_arr.extend(r.iter().cloned());
                 Ok(Value::new_array(new_arr))
+            }
+
+            (Value::Array(al), BinaryOp::Sub, Value::Array(ar)) => {
+                let l = al.read().unwrap();
+                let r = ar.read().unwrap();
+                let mut new_arr = Vec::new();
+                for val in l.iter() {
+                    if !r.contains(val) {
+                        new_arr.push(val.clone());
+                    }
+                }
+                Ok(Value::new_array(new_arr))
+            }
+            (Value::Hash(hl), BinaryOp::Sub, Value::Array(ar)) => {
+                let l = hl.read().unwrap();
+                let r = ar.read().unwrap();
+                let mut new_map = (*l).clone();
+                for val in r.iter() {
+                    if let Some(s) = val.as_str() {
+                        new_map.remove(s);
+                    } else if let Value::Symbol(s) = val {
+                        new_map.remove(s);
+                    }
+                }
+                Ok(Value::new_hash(new_map))
+            }
+            (Value::Hash(hl), BinaryOp::Sub, Value::Hash(hr)) => {
+                let l = hl.read().unwrap();
+                let r = hr.read().unwrap();
+                let mut new_map = (*l).clone();
+                for k in r.keys() {
+                    new_map.remove(k);
+                }
+                Ok(Value::new_hash(new_map))
             }
 
             (Value::Time(t), BinaryOp::Add, Value::Duration(s)) => {
