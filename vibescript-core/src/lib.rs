@@ -1260,6 +1260,57 @@ mod tests {
     }
 
     #[test]
+    fn test_gradual_typing() {
+        let source = "
+        def add(a: int, b: int) -> int
+          a + b
+        end
+
+        def find_user(id: int) -> string?
+          if id == 1
+            \"Gwen\"
+          else
+            nil
+          end
+        end
+
+        def process_union(v: int | string) -> string
+          v.to_string()
+        end
+
+        {
+          sum: add(1, 2),
+          user1: find_user(1),
+          user2: find_user(2),
+          union_int: process_union(10),
+          union_str: process_union(\"ok\")
+        }
+        ";
+        let result = execute(source).unwrap();
+        let h = result.as_hash().unwrap();
+        let got = h.read().unwrap();
+
+        assert_eq!(got.get("sum").unwrap(), &VibeValue::Int(3));
+        assert_eq!(
+            got.get("user1").unwrap(),
+            &VibeValue::String("Gwen".to_string())
+        );
+        assert_eq!(got.get("user2").unwrap(), &VibeValue::Nil);
+        assert_eq!(
+            got.get("union_int").unwrap(),
+            &VibeValue::String("10".to_string())
+        );
+        assert_eq!(
+            got.get("union_str").unwrap(),
+            &VibeValue::String("ok".to_string())
+        );
+
+        // Test violations
+        assert!(execute("def f(n: int) n end; f(\"wrong\")").is_err());
+        assert!(execute("def f -> int; \"wrong\" end; f()").is_err());
+    }
+
+    #[test]
     fn test_array_mutation() {
         let source = "
             arr = [1, 2]

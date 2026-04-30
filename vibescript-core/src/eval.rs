@@ -351,6 +351,7 @@ impl Engine {
             Stmt::Function(f) => {
                 let def = FunctionDef {
                     params: f.params.clone(),
+                    return_type: f.return_type.clone(),
                     body: f.body.clone(),
                     is_private: f.is_private,
                 };
@@ -414,6 +415,7 @@ impl Engine {
                             name.clone(),
                             FunctionDef {
                                 params: vec![],
+                                return_type: None,
                                 body: getter_body,
                                 is_private: false,
                             },
@@ -429,7 +431,9 @@ impl Engine {
                                 params: vec![Param {
                                     name: "val".to_string(),
                                     is_ivar: false,
+                                    param_type: None,
                                 }],
+                                return_type: None,
                                 body: setter_body,
                                 is_private: false,
                             },
@@ -2602,10 +2606,24 @@ impl Engine {
             ));
         }
 
-        let result = self.do_call_function_def(func, args, _block);
+        let result = self.do_call_function_def(func, args, _block)?;
+
+        if let Some(expected_ret_ty) = &func.return_type {
+            if let Err(e) = self.validate_value_type(&result.value(), expected_ret_ty) {
+                self.recursion_depth -= 1;
+                return Err(EvalError::Message(format!(
+                    "return value expected {}, got {}: {}",
+                    expected_ret_ty.name,
+                    result.value().kind_name(),
+                    match e {
+                        EvalError::Message(m) => m,
+                    }
+                )));
+            }
+        }
 
         self.recursion_depth -= 1;
-        result
+        Ok(result)
     }
 
     fn do_call_function_def(
@@ -2624,6 +2642,20 @@ impl Engine {
 
         let mut new_scope = HashMap::new();
         for (param, val) in func.params.iter().zip(args) {
+            if let Some(expected_ty) = &param.param_type {
+                if let Err(e) = self.validate_value_type(&val, expected_ty) {
+                    return Err(EvalError::Message(format!(
+                        "argument {} expected {}, got {}: {}",
+                        param.name,
+                        expected_ty.name,
+                        val.kind_name(),
+                        match e {
+                            EvalError::Message(m) => m,
+                        }
+                    )));
+                }
+            }
+
             new_scope.insert(param.name.clone(), val.clone());
             if param.is_ivar {
                 self.stack.push(new_scope.clone());
@@ -2890,4 +2922,269 @@ impl Engine {
             _ => Err("Binary operation not supported".to_string()),
         }
     }
+
+    fn validate_value_type(&mut self, val: &Value, expected: &TypeExpr) -> Result<(), EvalError> {
+        let mut state = TypeValidationState {
+            active: std::collections::HashSet::new(),
+        };
+        self.do_validate_value_type(val, expected, &mut state)
+    }
+
+    fn do_validate_value_type(
+        &mut self,
+        val: &Value,
+        expected: &TypeExpr,
+        state: &mut TypeValidationState,
+    ) -> Result<(), EvalError> {
+        if expected.nullable && val.is_nil() {
+            return Ok(());
+        }
+
+        // Cycle detection for recursive types
+        let visit = match val {
+            Value::Array(a) => Some((Arc::as_ptr(a) as usize, expected.clone())),
+            Value::Hash(h) | Value::Object(h) => Some((Arc::as_ptr(h) as usize, expected.clone())),
+            _ => None,
+        };
+
+        if let Some(v) = visit.as_ref() {
+            if state.active.contains(v) {
+                return Ok(());
+            }
+            state.active.insert(v.clone());
+        }
+
+        let result = match &expected.kind {
+            TypeKind::Any => Ok(()),
+            TypeKind::Int => {
+                if matches!(val, Value::Int(_)) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Int, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Float => {
+                if matches!(val, Value::Float(_)) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Float, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Number => {
+                if matches!(val, Value::Int(_) | Value::Float(_)) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Number, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::String => {
+                if matches!(val, Value::String(_)) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected String, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Bool => {
+                if matches!(val, Value::Bool(_)) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Bool, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Nil => {
+                if matches!(val, Value::Nil) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Nil, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Duration => {
+                if matches!(val, Value::Duration(_)) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Duration, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Time => {
+                if matches!(val, Value::Time(_)) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Time, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Money => {
+                if matches!(val, Value::Money { .. }) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Money, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Array => {
+                if let Value::Array(a) = val {
+                    if expected.type_args.is_empty() {
+                        Ok(())
+                    } else if expected.type_args.len() != 1 {
+                        Err(EvalError::Message(
+                            "Array type expects exactly 1 type argument".to_string(),
+                        ))
+                    } else {
+                        let elem_type = &expected.type_args[0];
+                        let arr = a.read().unwrap();
+                        for elem in arr.iter() {
+                            self.do_validate_value_type(elem, elem_type, state)?;
+                        }
+                        Ok(())
+                    }
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Array, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Hash => {
+                if let Value::Hash(h) | Value::Object(h) = val {
+                    if expected.type_args.is_empty() {
+                        Ok(())
+                    } else if expected.type_args.len() != 2 {
+                        Err(EvalError::Message(
+                            "Hash type expects exactly 2 type arguments".to_string(),
+                        ))
+                    } else {
+                        let key_type = &expected.type_args[0];
+                        let val_type = &expected.type_args[1];
+                        let hash = h.read().unwrap();
+                        for (k, v) in hash.iter() {
+                            self.do_validate_value_type(
+                                &Value::Symbol(k.clone()),
+                                key_type,
+                                state,
+                            )?;
+                            self.do_validate_value_type(v, val_type, state)?;
+                        }
+                        Ok(())
+                    }
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Hash, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Shape => {
+                if let Value::Hash(h) | Value::Object(h) = val {
+                    let hash = h.read().unwrap();
+                    if hash.len() != expected.shape.len() {
+                        return Err(EvalError::Message(format!(
+                            "Shape mismatch: expected {} fields, got {}",
+                            expected.shape.len(),
+                            hash.len()
+                        )));
+                    }
+                    for (field, field_type) in &expected.shape {
+                        if let Some(field_val) = hash.get(field) {
+                            self.do_validate_value_type(field_val, field_type, state)?;
+                        } else {
+                            return Err(EvalError::Message(format!("Missing field: {}", field)));
+                        }
+                    }
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Hash for Shape, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Union => {
+                for opt in &expected.union_types {
+                    if self.do_validate_value_type(val, opt, state).is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(EvalError::Message(format!(
+                    "Value {} does not match any union type",
+                    val.to_string()
+                )))
+            }
+            TypeKind::Enum => {
+                if let Value::EnumVariant { enum_name, .. } = val {
+                    if enum_name.to_lowercase() == expected.name.to_lowercase() {
+                        Ok(())
+                    } else {
+                        Err(EvalError::Message(format!(
+                            "Expected enum {}, got {}",
+                            expected.name, enum_name
+                        )))
+                    }
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected EnumVariant, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Function => {
+                if matches!(val, Value::Function(_) | Value::Builtin(_)) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Function, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            TypeKind::Object => {
+                if matches!(val, Value::Object(_)) {
+                    Ok(())
+                } else {
+                    Err(EvalError::Message(format!(
+                        "Expected Object, got {}",
+                        val.kind_name()
+                    )))
+                }
+            }
+            _ => Err(EvalError::Message(format!(
+                "Unsupported or unknown type {}",
+                expected.name
+            ))),
+        };
+
+        if let Some(v) = visit {
+            state.active.remove(&v);
+        }
+
+        result
+    }
+}
+
+struct TypeValidationState {
+    active: std::collections::HashSet<(usize, TypeExpr)>,
 }

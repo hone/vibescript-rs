@@ -1,4 +1,4 @@
-use crate::ast::Stmt;
+use crate::ast::{Stmt, TypeExpr};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
@@ -118,6 +118,7 @@ impl PartialEq for ClassDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDef {
     pub params: Vec<Param>,
+    pub return_type: Option<TypeExpr>,
     pub body: Vec<Stmt>,
     pub is_private: bool,
 }
@@ -126,6 +127,7 @@ pub struct FunctionDef {
 pub struct Param {
     pub name: String,
     pub is_ivar: bool,
+    pub param_type: Option<TypeExpr>,
 }
 
 #[derive(Debug)]
@@ -285,6 +287,30 @@ impl Value {
             Value::Nil => false,
             Value::Bool(b) => *b,
             _ => true,
+        }
+    }
+
+    pub fn kind_name(&self) -> &str {
+        match self {
+            Value::Nil => "nil",
+            Value::Bool(_) => "bool",
+            Value::Int(_) => "int",
+            Value::Float(_) => "float",
+            Value::String(_) => "string",
+            Value::Symbol(_) => "symbol",
+            Value::Time(_) => "time",
+            Value::Duration(_) => "duration",
+            Value::Money { .. } => "money",
+            Value::EnumVariant { .. } => "enum",
+            Value::Array(_) => "array",
+            Value::Hash(_) => "hash",
+            Value::Object(_) => "object",
+            Value::Block { .. } => "block",
+            Value::Function(_) => "function",
+            Value::Class(_) => "class",
+            Value::Instance(_) => "instance",
+            Value::Builtin(_) => "builtin",
+            Value::Namespace(_) => "namespace",
         }
     }
 

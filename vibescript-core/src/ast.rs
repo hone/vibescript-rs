@@ -153,10 +153,43 @@ pub enum PropertyKind {
     Setter,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TypeKind {
+    Any,
+    Int,
+    Float,
+    Number,
+    String,
+    Bool,
+    Nil,
+    Duration,
+    Time,
+    Money,
+    Array,
+    Hash,
+    Shape,
+    Union,
+    Enum,
+    Function,
+    Object,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TypeExpr {
+    pub name: String,
+    pub kind: TypeKind,
+    pub nullable: bool,
+    pub type_args: Vec<TypeExpr>,
+    pub shape: Vec<(String, TypeExpr)>, // Changed from HashMap to Vec for Hash/Eq and stable iteration
+    pub union_types: Vec<TypeExpr>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionStmt {
     pub name: String,
     pub params: Vec<crate::value::Param>,
+    pub return_type: Option<TypeExpr>,
     pub body: Vec<Stmt>,
     pub is_class_method: bool,
     pub is_private: bool,
@@ -164,6 +197,6 @@ pub struct FunctionStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RescueClause {
-    pub types: Vec<String>,
+    pub types: Vec<TypeExpr>,
     pub body: Vec<Stmt>,
 }

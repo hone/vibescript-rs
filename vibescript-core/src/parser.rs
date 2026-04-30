@@ -55,6 +55,111 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
 
         let member_name_parser = name_parser.clone().or(keyword_name_parser).boxed();
 
+        let type_expr_parser = recursive(|type_expr| {
+            let base_type = select! {
+                Token::Ident(name) => {
+                    let mut nullable = false;
+                    let mut clean_name = name.clone();
+                    if name.ends_with('?') {
+                        nullable = true;
+                        clean_name.pop();
+                    }
+
+                    let kind = match clean_name.as_str() {
+                        "Any" | "any" => TypeKind::Any,
+                        "Int" | "int" => TypeKind::Int,
+                        "Float" | "float" => TypeKind::Float,
+                        "Number" | "number" => TypeKind::Number,
+                        "String" | "string" => TypeKind::String,
+                        "Bool" | "bool" => TypeKind::Bool,
+                        "Nil" | "nil" => TypeKind::Nil,
+                        "Duration" | "duration" => TypeKind::Duration,
+                        "Time" | "time" => TypeKind::Time,
+                        "Money" | "money" => TypeKind::Money,
+                        "Array" | "array" => TypeKind::Array,
+                        "Hash" | "hash" => TypeKind::Hash,
+                        "Function" | "function" => TypeKind::Function,
+                        "Object" | "object" => TypeKind::Object,
+                        _ => TypeKind::Enum,
+                    };
+
+                    TypeExpr {
+                        name: clean_name,
+                        kind,
+                        nullable,
+                        type_args: Vec::new(),
+                        shape: Vec::new(),
+                        union_types: Vec::new(),
+                    }
+                }
+            }
+            .then_ignore(just(Token::Dot).not());
+
+            let generic_type = base_type
+                .then(
+                    type_expr
+                        .clone()
+                        .separated_by(just(Token::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(just(Token::Lt), just(Token::Gt))
+                        .or_not(),
+                )
+                .map(|(mut ty, args)| {
+                    if let Some(args) = args {
+                        ty.type_args = args;
+                    }
+                    ty
+                });
+
+            let shape_type = just(Token::LBrace)
+                .ignore_then(
+                    member_name_parser
+                        .clone()
+                        .then_ignore(just(Token::Colon))
+                        .then(type_expr.clone())
+                        .separated_by(just(Token::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<_>>(),
+                )
+                .then_ignore(just(Token::RBrace))
+                .map(|shape| TypeExpr {
+                    name: "Shape".to_string(),
+                    kind: TypeKind::Shape,
+                    nullable: false,
+                    type_args: Vec::new(),
+                    shape,
+                    union_types: Vec::new(),
+                });
+
+            let primary_type = choice((generic_type, shape_type));
+
+            primary_type
+                .then(
+                    just(Token::Pipe)
+                        .ignore_then(type_expr)
+                        .repeated()
+                        .collect::<Vec<_>>(),
+                )
+                .map(|(first, rest)| {
+                    if rest.is_empty() {
+                        first
+                    } else {
+                        let mut types = vec![first];
+                        types.extend(rest);
+                        TypeExpr {
+                            name: "Union".to_string(),
+                            kind: TypeKind::Union,
+                            nullable: false,
+                            type_args: Vec::new(),
+                            shape: Vec::new(),
+                            union_types: types,
+                        }
+                    }
+                })
+        })
+        .boxed();
+
         let block_body = stmt.clone().repeated().collect::<Vec<_>>().boxed();
 
         let block_lit = just(Token::Do)
@@ -62,7 +167,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                 select! { Token::Ident(name) => name, Token::Ivar(name) => format!("@{}", name) }
                     .then(
                         just(Token::Colon)
-                            .ignore_then(member_name_parser.clone())
+                            .ignore_then(type_expr_parser.clone())
                             .or_not(),
                     )
                     .map(|(name, _type)| name)
@@ -479,10 +584,14 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                 select! { Token::Ident(name) => (name, false), Token::Ivar(name) => (name, true) }
                     .then(
                         just(Token::Colon)
-                            .ignore_then(member_name_parser.clone())
+                            .ignore_then(type_expr_parser.clone())
                             .or_not(),
-                    ) // Ignore param type
-                    .map(|((name, is_ivar), _type)| Param { name, is_ivar })
+                    )
+                    .map(|((name, is_ivar), param_type)| Param {
+                        name,
+                        is_ivar,
+                        param_type,
+                    })
                     .separated_by(just(Token::Comma))
                     .allow_trailing()
                     .collect::<Vec<_>>()
@@ -492,17 +601,18 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             .then(
                 just(Token::Minus)
                     .ignore_then(just(Token::Gt))
-                    .ignore_then(member_name_parser.clone())
+                    .ignore_then(type_expr_parser.clone())
                     .or_not(),
-            ) // Ignore return type
+            )
             .then(block_body.clone())
             .then_ignore(just(Token::End))
             .map(
-                |((((is_private, (name, is_class_method)), params), _ret_type), body)| {
+                |((((is_private, (name, is_class_method)), params), return_type), body)| {
                     let is_private = is_private as Option<Token>;
                     Stmt::Function(FunctionStmt {
                         name,
                         params,
+                        return_type,
                         body,
                         is_class_method,
                         is_private: is_private.is_some(),
@@ -615,9 +725,10 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             .then(
                 just(Token::Rescue)
                     .ignore_then(
-                        name_parser
+                        type_expr_parser
                             .clone()
                             .separated_by(just(Token::Comma))
+                            .allow_trailing()
                             .collect::<Vec<_>>()
                             .delimited_by(just(Token::LParen), just(Token::RParen))
                             .or_not(),
