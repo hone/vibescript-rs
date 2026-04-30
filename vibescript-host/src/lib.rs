@@ -4,7 +4,7 @@ use wasmtime_wasi::WasiCtx;
 
 wasmtime::component::bindgen!({
     world: "engine",
-    path: "wit",
+    path: "../wit",
     exports: {
         "xipkit:vibes/engine-world": async,
     },

@@ -13,7 +13,7 @@ use chumsky::prelude::*;
 #[cfg(target_arch = "wasm32")]
 wit_bindgen::generate!({
     world: "engine",
-    path: "wit/vibes.wit",
+    path: "../wit/vibes.wit",
 });
 
 #[cfg(target_arch = "wasm32")]
@@ -1318,7 +1318,7 @@ mod tests {
           yield 2
           yield 3
         end
-        
+
         def safe_div(a: int, b: int)
           begin
             if b == 0
@@ -1337,7 +1337,7 @@ mod tests {
             \"caught type error\"
           end
         end
-        
+
         def catch_fail_helper
           begin
             typed_rescue_mismatch()
