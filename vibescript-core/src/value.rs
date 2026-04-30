@@ -121,6 +121,7 @@ pub struct FunctionDef {
     pub return_type: Option<TypeExpr>,
     pub body: Vec<Stmt>,
     pub is_private: bool,
+    pub is_exported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

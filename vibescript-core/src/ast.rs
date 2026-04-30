@@ -39,6 +39,10 @@ pub enum Expr {
         params: Vec<String>,
         body: Vec<Stmt>,
     },
+    BlockExpr(Box<Stmt>),
+    Yield {
+        args: Vec<Expr>,
+    },
     InterpolatedString(Vec<StringPart>),
     If {
         condition: Box<Expr>,
@@ -122,6 +126,7 @@ pub enum Stmt {
     Break,
     Next,
     Function(FunctionStmt),
+    Raise(Expr),
     EnumDef {
         name: String,
         members: Vec<EnumMember>,
@@ -193,6 +198,7 @@ pub struct FunctionStmt {
     pub body: Vec<Stmt>,
     pub is_class_method: bool,
     pub is_private: bool,
+    pub is_exported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

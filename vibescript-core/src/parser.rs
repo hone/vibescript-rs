@@ -19,7 +19,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
         }
         .boxed();
 
-        let keyword_name_parser = choice((
+        let keyword_group_1 = choice((
             just(Token::In).to("in".to_string()),
             just(Token::Do).to("do".to_string()),
             just(Token::If).to("if".to_string()),
@@ -35,23 +35,28 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             just(Token::False).to("false".to_string()),
             just(Token::Nil).to("nil".to_string()),
             just(Token::Then).to("then".to_string()),
+        ));
+
+        let keyword_group_2 = choice((
             just(Token::Case).to("case".to_string()),
             just(Token::When).to("when".to_string()),
             just(Token::Begin).to("begin".to_string()),
             just(Token::Rescue).to("rescue".to_string()),
             just(Token::Ensure).to("ensure".to_string()),
+            just(Token::Raise).to("raise".to_string()),
+            just(Token::Yield).to("yield".to_string()),
+            just(Token::Export).to("export".to_string()),
             just(Token::Enum).to("enum".to_string()),
             just(Token::Class).to("class".to_string()),
             just(Token::SelfToken).to("self".to_string()),
             just(Token::Property).to("property".to_string()),
             just(Token::Getter).to("getter".to_string()),
             just(Token::Setter).to("setter".to_string()),
-        ))
-        .or(choice((
             just(Token::Private).to("private".to_string()),
             just(Token::Def).to("def".to_string()),
-        )))
-        .boxed();
+        ));
+
+        let keyword_name_parser = keyword_group_1.or(keyword_group_2).boxed();
 
         let member_name_parser = name_parser.clone().or(keyword_name_parser).boxed();
 
@@ -141,7 +146,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                         .repeated()
                         .collect::<Vec<_>>(),
                 )
-                .map(|(first, rest)| {
+                .map(|(first, rest): (TypeExpr, Vec<TypeExpr>)| {
                     if rest.is_empty() {
                         first
                     } else {
@@ -301,6 +306,51 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                 })
                 .boxed();
 
+            let begin_stmt = just(Token::Begin)
+                .ignore_then(block_body.clone())
+                .then(
+                    just(Token::Rescue)
+                        .ignore_then(
+                            type_expr_parser
+                                .clone()
+                                .separated_by(just(Token::Comma))
+                                .allow_trailing()
+                                .collect::<Vec<_>>()
+                                .delimited_by(just(Token::LParen), just(Token::RParen))
+                                .or_not(),
+                        )
+                        .then(block_body.clone())
+                        .map(|(types, body)| RescueClause {
+                            types: types.unwrap_or_default(),
+                            body,
+                        })
+                        .or_not(),
+                )
+                .then(just(Token::Ensure).ignore_then(block_body.clone()).or_not())
+                .map(|((body, rescue), ensure)| Stmt::Try {
+                    body,
+                    rescue,
+                    ensure,
+                })
+                .boxed();
+
+            let yield_expr = just(Token::Yield)
+                .ignore_then(choice((
+                    expr.clone()
+                        .separated_by(just(Token::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(just(Token::LParen), just(Token::RParen)),
+                    expr.clone()
+                        .then_ignore(just(Token::Assign).not().rewind())
+                        .separated_by(just(Token::Comma))
+                        .at_least(1)
+                        .allow_trailing()
+                        .collect::<Vec<_>>(),
+                    empty().to(vec![]),
+                )))
+                .map(|args| Expr::Yield { args })
+                .boxed();
             let atom = choice((
                 literal,
                 variable,
@@ -309,6 +359,8 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                 if_expr,
                 case_expr,
                 block_lit.clone(),
+                yield_expr,
+                begin_stmt.clone().map(|s| Expr::BlockExpr(Box::new(s))),
                 expr.clone()
                     .delimited_by(just(Token::LParen), just(Token::RParen)),
             ))
@@ -363,7 +415,13 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
                             }),
                     ))
                     .repeated(),
-                    |lhs, (kind, args_with_names, name, block)| {
+                    |lhs: Expr,
+                     (kind, args_with_names, name, block): (
+                        &str,
+                        Vec<(Option<String>, Expr)>,
+                        String,
+                        Option<Expr>,
+                    )| {
                         let mut args = Vec::new();
                         let mut kwargs = Vec::new();
                         for (name_opt, val) in args_with_names {
@@ -570,56 +628,64 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             })
             .boxed();
 
-        let def_stmt = just(Token::Private)
-            .or_not()
-            .then_ignore(just(Token::Def))
-            .then(choice((
-                just(Token::SelfToken)
-                    .ignore_then(just(Token::Dot))
-                    .ignore_then(member_name_parser.clone())
-                    .map(|name| (name, true)),
-                name_parser.clone().map(|name| (name, false)),
-            )))
-            .then(choice((
-                select! { Token::Ident(name) => (name, false), Token::Ivar(name) => (name, true) }
-                    .then(
-                        just(Token::Colon)
-                            .ignore_then(type_expr_parser.clone())
-                            .or_not(),
-                    )
-                    .map(|((name, is_ivar), param_type)| Param {
-                        name,
-                        is_ivar,
-                        param_type,
-                    })
-                    .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen)),
-                empty().to(vec![]),
-            )))
-            .then(
-                just(Token::Minus)
-                    .ignore_then(just(Token::Gt))
-                    .ignore_then(type_expr_parser.clone())
-                    .or_not(),
-            )
-            .then(block_body.clone())
-            .then_ignore(just(Token::End))
-            .map(
-                |((((is_private, (name, is_class_method)), params), return_type), body)| {
-                    let is_private = is_private as Option<Token>;
-                    Stmt::Function(FunctionStmt {
-                        name,
-                        params,
-                        return_type,
-                        body,
-                        is_class_method,
-                        is_private: is_private.is_some(),
-                    })
-                },
-            )
-            .boxed();
+        let def_stmt = choice((
+            just(Token::Private).to(("private", true)),
+            just(Token::Export).to(("export", true)),
+        ))
+        .or_not()
+        .then_ignore(just(Token::Def))
+        .then(choice((
+            just(Token::SelfToken)
+                .ignore_then(just(Token::Dot))
+                .ignore_then(member_name_parser.clone())
+                .map(|name| (name, true)),
+            name_parser.clone().map(|name| (name, false)),
+        )))
+        .then(choice((
+            select! { Token::Ident(name) => (name, false), Token::Ivar(name) => (name, true) }
+                .then(
+                    just(Token::Colon)
+                        .ignore_then(type_expr_parser.clone())
+                        .or_not(),
+                )
+                .map(|((name, is_ivar), param_type)| Param {
+                    name,
+                    is_ivar,
+                    param_type,
+                })
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+            empty().to(vec![]),
+        )))
+        .then(
+            just(Token::Minus)
+                .ignore_then(just(Token::Gt))
+                .ignore_then(type_expr_parser.clone())
+                .or_not(),
+        )
+        .then(block_body.clone())
+        .then_ignore(just(Token::End))
+        .map(
+            |((((modifier, (name, is_class_method)), params), return_type), body)| {
+                let (is_private, is_exported) = match modifier {
+                    Some(("private", _)) => (true, false),
+                    Some(("export", _)) => (false, true),
+                    _ => (false, false),
+                };
+                Stmt::Function(FunctionStmt {
+                    name,
+                    params,
+                    return_type,
+                    body,
+                    is_class_method,
+                    is_private,
+                    is_exported,
+                })
+            },
+        )
+        .boxed();
 
         let enum_stmt = just(Token::Enum)
             .ignore_then(name_parser.clone())
@@ -749,6 +815,11 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             })
             .boxed();
 
+        let raise_stmt = just(Token::Raise)
+            .ignore_then(expr.clone())
+            .map(Stmt::Raise)
+            .boxed();
+
         choice((
             if_stmt,
             while_stmt,
@@ -763,6 +834,7 @@ fn stmt_parser<'a>() -> impl Parser<'a, &'a [Token], Stmt, ParserExtra<'a>> {
             break_stmt,
             next_stmt,
             begin_stmt,
+            raise_stmt,
             assignment,
             expr.clone().map(Stmt::Expression),
         ))

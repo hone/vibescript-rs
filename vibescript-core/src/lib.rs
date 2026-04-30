@@ -120,7 +120,7 @@ impl GuestScript for MyScriptWrapper {
                         break;
                     }
                 }
-                Err(eval::EvalError::Message(m)) => return Err(m),
+                Err(e) => return Err(format!("{}: {}", e.kind, e.message)),
             }
         }
 
@@ -228,9 +228,9 @@ pub fn execute(source: &str) -> Result<value::Value, String> {
         .into_result()
         .map_err(|e| format_parse_errors(source, e, &spans))?;
 
-    engine.eval_script(&stmts).map_err(|e| match e {
-        eval::EvalError::Message(m) => m,
-    })
+    engine
+        .eval_script(&stmts)
+        .map_err(|e| format!("{}: {}", e.kind, e.message))
 }
 
 #[cfg(test)]
@@ -1308,6 +1308,67 @@ mod tests {
         // Test violations
         assert!(execute("def f(n: int) n end; f(\"wrong\")").is_err());
         assert!(execute("def f -> int; \"wrong\" end; f()").is_err());
+    }
+
+    #[test]
+    fn test_yield_and_raise_parity() {
+        let source = "
+        def three_times
+          yield 1
+          yield 2
+          yield 3
+        end
+        
+        def safe_div(a: int, b: int)
+          begin
+            if b == 0
+              raise \"division by zero\"
+            end
+            a / b
+          rescue(RuntimeError)
+            -1
+          end
+        end
+
+        def typed_rescue_mismatch
+          begin
+            raise \"boom\"
+          rescue(TypeError)
+            \"caught type error\"
+          end
+        end
+        
+        def catch_fail_helper
+          begin
+            typed_rescue_mismatch()
+          rescue
+            \"caught runtime error\"
+          end
+        end
+
+        results = []
+        three_times() do |x|
+          results = results.push(x)
+        end
+
+        {
+          yield_sum: results.sum(),
+          div_ok: safe_div(10, 2),
+          div_fail: safe_div(10, 0),
+          catch_fail: catch_fail_helper()
+        }
+        ";
+        let result = execute(source).unwrap();
+        let h = result.as_hash().unwrap();
+        let got = h.read().unwrap();
+
+        assert_eq!(got.get("yield_sum").unwrap(), &VibeValue::Int(6));
+        assert_eq!(got.get("div_ok").unwrap(), &VibeValue::Int(5));
+        assert_eq!(got.get("div_fail").unwrap(), &VibeValue::Int(-1));
+        assert_eq!(
+            got.get("catch_fail").unwrap(),
+            &VibeValue::String("caught runtime error".to_string())
+        );
     }
 
     #[test]

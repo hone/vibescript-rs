@@ -29,6 +29,9 @@ pub enum Token {
     Private,
     Return,
     Assert,
+    Export,
+    Raise,
+    Yield,
     True,
     False,
     Nil,
@@ -131,6 +134,12 @@ enum NormalToken {
     Setter,
     #[token("private")]
     Private,
+    #[token("export")]
+    Export,
+    #[token("raise")]
+    Raise,
+    #[token("yield")]
+    Yield,
     #[token("return")]
     Return,
     #[token("assert")]
@@ -377,6 +386,9 @@ fn map_normal_token(tok: NormalToken) -> Token {
         NormalToken::Getter => Token::Getter,
         NormalToken::Setter => Token::Setter,
         NormalToken::Private => Token::Private,
+        NormalToken::Export => Token::Export,
+        NormalToken::Raise => Token::Raise,
+        NormalToken::Yield => Token::Yield,
         NormalToken::Return => Token::Return,
         NormalToken::Assert => Token::Assert,
         NormalToken::True => Token::True,
@@ -447,6 +459,9 @@ impl fmt::Display for Token {
             Token::Getter => write!(f, "getter"),
             Token::Setter => write!(f, "setter"),
             Token::Private => write!(f, "private"),
+            Token::Export => write!(f, "export"),
+            Token::Raise => write!(f, "raise"),
+            Token::Yield => write!(f, "yield"),
             Token::Return => write!(f, "return"),
             Token::Assert => write!(f, "assert"),
             Token::True => write!(f, "true"),

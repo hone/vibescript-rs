@@ -32,18 +32,29 @@ pub struct Engine {
     pub module_resolver: Option<Arc<dyn ModuleResolver>>,
     pub compiler: Option<Arc<dyn Compiler>>,
     pub current_module_path: Option<String>,
+    pub current_block: Option<Value>,
 }
 
 const MAX_RECURSION_DEPTH: usize = 500;
 
-#[derive(Debug)]
-pub enum EvalError {
-    Message(String),
+#[derive(Debug, Clone)]
+pub struct EvalError {
+    pub kind: String,
+    pub message: String,
+}
+
+impl EvalError {
+    pub fn new(kind: &str, message: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            message: message.to_string(),
+        }
+    }
 }
 
 impl From<String> for EvalError {
     fn from(msg: String) -> Self {
-        EvalError::Message(msg)
+        EvalError::new("RuntimeError", &msg)
     }
 }
 
@@ -90,6 +101,7 @@ impl Engine {
             module_resolver: None,
             compiler: None,
             current_module_path: None,
+            current_block: None,
         }
     }
 
@@ -166,30 +178,32 @@ impl Engine {
         let resolver = self
             .module_resolver
             .clone()
-            .ok_or_else(|| EvalError::Message("Module resolver not configured".to_string()))?;
+            .ok_or_else(|| EvalError::new("RuntimeError", "Module resolver not configured"))?;
         let compiler = self
             .compiler
             .clone()
-            .ok_or_else(|| EvalError::Message("Compiler not configured".to_string()))?;
+            .ok_or_else(|| EvalError::new("RuntimeError", "Compiler not configured"))?;
 
         let (source, resolved_path) = resolver
             .load_module(name, self.current_module_path.as_deref())
-            .map_err(EvalError::Message)?;
+            .map_err(|e| EvalError::new("RuntimeError", &e))?;
 
         if let Some(cached) = self.modules.get(&resolved_path) {
             return Ok(cached.clone());
         }
 
         if self.loading_modules.contains(&resolved_path) {
-            return Err(EvalError::Message(format!(
-                "Circular dependency detected: {}",
-                resolved_path
-            )));
+            return Err(EvalError::new(
+                "RuntimeError",
+                &format!("Circular dependency detected: {}", resolved_path),
+            ));
         }
 
         self.loading_modules.push(resolved_path.clone());
 
-        let stmts = compiler.compile(&source).map_err(EvalError::Message)?;
+        let stmts = compiler
+            .compile(&source)
+            .map_err(|e| EvalError::new("RuntimeError", &e))?;
 
         let mut mod_engine = Engine::new();
         mod_engine.module_resolver = self.module_resolver.clone();
@@ -220,9 +234,9 @@ impl Engine {
                 }
             }
 
-            // 2. Functions (non-private)
+            // 2. Functions (non-private or explicitly exported)
             for (name, func) in &mod_engine.functions {
-                if !func.is_private {
+                if !func.is_private || func.is_exported {
                     let fn_val = Value::Function(Arc::new(func.clone()));
                     exports_map.insert(name.clone(), fn_val.clone());
 
@@ -354,6 +368,7 @@ impl Engine {
                     return_type: f.return_type.clone(),
                     body: f.body.clone(),
                     is_private: f.is_private,
+                    is_exported: f.is_exported,
                 };
                 if f.is_class_method {
                     if let Some(Value::Class(c)) = self.get_var("self") {
@@ -367,6 +382,10 @@ impl Engine {
                     }
                 }
                 Ok(ControlFlow::Continue(Value::Nil))
+            }
+            Stmt::Raise(expr) => {
+                let val = self.eval_expr(expr)?;
+                Err(EvalError::new("RuntimeError", &val.to_string()))
             }
             Stmt::EnumDef { name, members } => {
                 self.enums.insert(name.clone(), stmt.clone());
@@ -407,7 +426,7 @@ impl Engine {
 
                 Ok(ControlFlow::Continue(Value::Nil))
             }
-            Stmt::PropertyDecl { names, .. } => {
+            Stmt::PropertyDecl { names, kind: _ } => {
                 if let Some(Value::Class(c)) = self.get_var("self") {
                     for name in names {
                         let getter_body = vec![Stmt::Return(Some(Expr::InstanceVar(name.clone())))];
@@ -418,6 +437,7 @@ impl Engine {
                                 return_type: None,
                                 body: getter_body,
                                 is_private: false,
+                                is_exported: false,
                             },
                         );
                         let setter_name = format!("{}=", name);
@@ -436,6 +456,7 @@ impl Engine {
                                 return_type: None,
                                 body: setter_body,
                                 is_private: false,
+                                is_exported: false,
                             },
                         );
                     }
@@ -458,7 +479,7 @@ impl Engine {
                     } else {
                         "assertion failed".to_string()
                     };
-                    return Err(EvalError::Message(msg));
+                    return Err(EvalError::new("AssertionError", &msg));
                 }
                 Ok(ControlFlow::Continue(Value::Nil))
             }
@@ -472,11 +493,27 @@ impl Engine {
                 let res = self.eval_block(body);
                 let final_res = match res {
                     Ok(cf) => Ok(cf),
-                    Err(EvalError::Message(_)) => {
+                    Err(e) => {
                         if let Some(r) = rescue {
-                            self.eval_block(&r.body)
+                            let mut matches = r.types.is_empty();
+                            if !matches {
+                                for ty in &r.types {
+                                    if ty.name.to_lowercase() == e.kind.to_lowercase()
+                                        || (ty.name == "Error" && e.kind == "RuntimeError")
+                                    {
+                                        matches = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if matches {
+                                self.eval_block(&r.body)
+                            } else {
+                                Err(e)
+                            }
                         } else {
-                            res
+                            Err(e)
                         }
                     }
                 };
@@ -495,11 +532,16 @@ impl Engine {
                 if name == "uuid" {
                     return Ok(Value::String(Uuid::new_v4().to_string()));
                 }
-                self.get_var(name)
-                    .ok_or_else(|| EvalError::Message(format!("Variable '{}' not found", name)))
+                self.get_var(name).ok_or_else(|| {
+                    EvalError::new("RuntimeError", &format!("Variable '{}' not found", name))
+                })
             }
-            Expr::InstanceVar(name) => self.get_ivar(name).map_err(EvalError::Message),
-            Expr::ClassVar(name) => self.get_cvar(name).map_err(EvalError::Message),
+            Expr::InstanceVar(name) => self
+                .get_ivar(name)
+                .map_err(|e| EvalError::new("RuntimeError", &e)),
+            Expr::ClassVar(name) => self
+                .get_cvar(name)
+                .map_err(|e| EvalError::new("RuntimeError", &e)),
             Expr::Binary { left, op, right } => {
                 let lhs = self.eval_expr(left)?;
                 if *op == BinaryOp::And {
@@ -517,11 +559,13 @@ impl Engine {
                     };
                 }
                 let rhs = self.eval_expr(right)?;
-                self.eval_binary(lhs, *op, rhs).map_err(EvalError::Message)
+                self.eval_binary(lhs, *op, rhs)
+                    .map_err(|e| EvalError::new("RuntimeError", &e))
             }
             Expr::Unary { op, expr } => {
                 let val = self.eval_expr(expr)?;
-                self.eval_unary(*op, &val).map_err(EvalError::Message)
+                self.eval_unary(*op, &val)
+                    .map_err(|e| EvalError::new("RuntimeError", &e))
             }
             Expr::Call {
                 func,
@@ -564,7 +608,7 @@ impl Engine {
                     "json_parse" => {
                         if let Some(Value::String(s)) = arg_vals.first() {
                             let v: serde_json::Value = serde_json::from_str(s).map_err(|e| {
-                                EvalError::Message(format!("JSON parse error: {}", e))
+                                EvalError::new("RuntimeError", &format!("JSON parse error: {}", e))
                             })?;
                             return Ok(self.json_to_vibe(v));
                         }
@@ -604,13 +648,15 @@ impl Engine {
                     "random_id" => {
                         let len = arg_vals.first().and_then(|v| v.as_int()).unwrap_or(16);
                         if len <= 0 {
-                            return Err(EvalError::Message(
-                                "random_id length must be positive".to_string(),
+                            return Err(EvalError::new(
+                                "RuntimeError",
+                                "random_id length must be positive",
                             ));
                         }
                         if len > 1024 {
-                            return Err(EvalError::Message(
-                                "random_id length exceeds maximum 1024".to_string(),
+                            return Err(EvalError::new(
+                                "RuntimeError",
+                                "random_id length exceeds maximum 1024",
                             ));
                         }
                         let s: String = rand::thread_rng()
@@ -624,8 +670,9 @@ impl Engine {
                         if let Some(Value::String(name)) = arg_vals.first() {
                             return self.builtin_require(name, &Some(kwarg_vals));
                         } else {
-                            return Err(EvalError::Message(
-                                "require expects a string argument".to_string(),
+                            return Err(EvalError::new(
+                                "RuntimeError",
+                                "require expects a string argument",
                             ));
                         }
                     }
@@ -655,7 +702,10 @@ impl Engine {
                     }
                 }
 
-                Err(EvalError::Message(format!("Function '{}' not found", func)))
+                Err(EvalError::new(
+                    "RuntimeError",
+                    &format!("Function '{}' not found", func),
+                ))
             }
             Expr::Member {
                 receiver,
@@ -713,6 +763,34 @@ impl Engine {
                 params: params.clone(),
                 body: body.clone(),
             }),
+            Expr::BlockExpr(stmt) => self.eval_stmt(stmt).map(|cf| cf.value()),
+            Expr::Yield { args } => {
+                let mut arg_vals = Vec::new();
+                for arg in args {
+                    arg_vals.push(self.eval_expr(arg)?);
+                }
+                let block_val = self.current_block.clone().ok_or_else(|| {
+                    EvalError::new(
+                        "RuntimeError",
+                        "yield used outside of block-receiving function",
+                    )
+                })?;
+                if let Value::Block { params, body } = block_val {
+                    let mut new_scope = HashMap::new();
+                    for (param, val) in params.iter().zip(arg_vals) {
+                        new_scope.insert(param.clone(), val);
+                    }
+                    self.stack.push(new_scope);
+                    let cf = self.eval_block(&body)?;
+                    self.stack.pop();
+                    Ok(cf.value())
+                } else {
+                    Err(EvalError::new(
+                        "RuntimeError",
+                        "yield target is not a block",
+                    ))
+                }
+            }
             Expr::InterpolatedString(parts) => {
                 let mut result = String::new();
                 for part in parts {
@@ -813,10 +891,10 @@ impl Engine {
             inst.write().unwrap().ivars.insert(name.to_string(), val);
             Ok(())
         } else {
-            Err(EvalError::Message(format!(
-                "Cannot set instance variable '{}' outside instance",
-                name
-            )))
+            Err(EvalError::new(
+                "RuntimeError",
+                &format!("Cannot set instance variable '{}' outside instance", name),
+            ))
         }
     }
 
@@ -919,8 +997,9 @@ impl Engine {
             match (ns.as_str(), method) {
                 ("JSON", "parse") => {
                     if let Some(Value::String(s)) = args.first() {
-                        let v: serde_json::Value = serde_json::from_str(s)
-                            .map_err(|e| EvalError::Message(format!("JSON parse error: {}", e)))?;
+                        let v: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+                            EvalError::new("RuntimeError", &format!("JSON parse error: {}", e))
+                        })?;
                         return Ok(self.json_to_vibe(v));
                     }
                 }
@@ -928,7 +1007,7 @@ impl Engine {
                     if let Some(v) = args.first() {
                         let json = self.vibe_to_json(v.clone());
                         let s = serde_json::to_string(&json).map_err(|e| {
-                            EvalError::Message(format!("JSON stringify error: {}", e))
+                            EvalError::new("RuntimeError", &format!("JSON stringify error: {}", e))
                         })?;
                         return Ok(Value::String(s));
                     }
@@ -955,14 +1034,17 @@ impl Engine {
                                         .unwrap_or_else(|| ndt.and_utc())
                                 })
                             })
-                            .map_err(|e| EvalError::Message(format!("Time parse error: {}", e)))?;
+                            .map_err(|e| {
+                                EvalError::new("RuntimeError", &format!("Time parse error: {}", e))
+                            })?;
                         return Ok(Value::Time(t));
                     }
                 }
                 ("Regex", "match") => {
                     let pattern = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
                     let s = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-                    let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                    let re = Regex::new(pattern)
+                        .map_err(|e| EvalError::new("RuntimeError", &e.to_string()))?;
                     if let Some(caps) = re.captures(s) {
                         let groups: Vec<Value> = caps
                             .iter()
@@ -979,21 +1061,23 @@ impl Engine {
                     let s = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
                     let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
                     let replacement = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
-                    let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                    let re = Regex::new(pattern)
+                        .map_err(|e| EvalError::new("RuntimeError", &e.to_string()))?;
                     return Ok(Value::String(re.replace(s, replacement).to_string()));
                 }
                 ("Regex", "replace_all") => {
                     let s = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
                     let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
                     let replacement = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
-                    let re = Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                    let re = Regex::new(pattern)
+                        .map_err(|e| EvalError::new("RuntimeError", &e.to_string()))?;
                     return Ok(Value::String(re.replace_all(s, replacement).to_string()));
                 }
                 _ => {
-                    return Err(EvalError::Message(format!(
-                        "Method '{}' not found for namespace '{}'",
-                        method, ns
-                    )));
+                    return Err(EvalError::new(
+                        "RuntimeError",
+                        &format!("Method '{}' not found for namespace '{}'", method, ns),
+                    ));
                 }
             }
         }
@@ -1013,10 +1097,10 @@ impl Engine {
                     }
                     return Ok(val);
                 } else {
-                    return Err(EvalError::Message(format!(
-                        "Member '{}' not found in Object",
-                        method
-                    )));
+                    return Err(EvalError::new(
+                        "RuntimeError",
+                        &format!("Member '{}' not found in Object", method),
+                    ));
                 }
             }
             (Value::Hash(h), method, block) => {
@@ -1048,8 +1132,9 @@ impl Engine {
                             let key = match arg {
                                 Value::String(s) | Value::Symbol(s) => s.clone(),
                                 _ => {
-                                    return Err(EvalError::Message(
-                                        "Hash.fetch key must be string or symbol".to_string(),
+                                    return Err(EvalError::new(
+                                        "TypeError",
+                                        "Hash.fetch key must be string or symbol",
                                     ));
                                 }
                             };
@@ -1061,7 +1146,7 @@ impl Engine {
                             }
                             Ok(Value::Nil)
                         } else {
-                            Err(EvalError::Message("Hash.fetch expects a key".to_string()))
+                            Err(EvalError::new("ArgumentError", "Hash.fetch expects a key"))
                         }
                     }
                     "keys" => {
@@ -1108,7 +1193,7 @@ impl Engine {
                             }
                             Ok(Value::Hash(h.clone()))
                         } else {
-                            Err(EvalError::Message("each_key requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "each_key requires a block"))
                         }
                     }
                     "each_value" => {
@@ -1131,8 +1216,9 @@ impl Engine {
                             }
                             Ok(Value::Hash(h.clone()))
                         } else {
-                            Err(EvalError::Message(
-                                "each_value requires a block".to_string(),
+                            Err(EvalError::new(
+                                "ArgumentError",
+                                "each_value requires a block",
                             ))
                         }
                     }
@@ -1141,8 +1227,9 @@ impl Engine {
                             let res = self.deep_transform_hash_keys(&hash, params, body)?;
                             Ok(Value::new_hash(res))
                         } else {
-                            Err(EvalError::Message(
-                                "deep_transform_keys requires a block".to_string(),
+                            Err(EvalError::new(
+                                "ArgumentError",
+                                "deep_transform_keys requires a block",
                             ))
                         }
                     }
@@ -1155,9 +1242,9 @@ impl Engine {
                                     let new_key = match new_key_val {
                                         Value::String(s) | Value::Symbol(s) => s.clone(),
                                         _ => {
-                                            return Err(EvalError::Message(
-                                                "remap_keys mapping values must be symbol or string"
-                                                    .to_string(),
+                                            return Err(EvalError::new(
+                                                "TypeError",
+                                                "remap_keys mapping values must be symbol or string",
                                             ));
                                         }
                                     };
@@ -1168,8 +1255,9 @@ impl Engine {
                             }
                             Ok(Value::new_hash(new_map))
                         } else {
-                            Err(EvalError::Message(
-                                "remap_keys expects a mapping hash".to_string(),
+                            Err(EvalError::new(
+                                "ArgumentError",
+                                "remap_keys expects a mapping hash",
                             ))
                         }
                     }
@@ -1184,8 +1272,9 @@ impl Engine {
                                 return Ok(Value::new_hash(new_map));
                             }
                         }
-                        Err(EvalError::Message(
-                            "Hash.merge expects another Hash".to_string(),
+                        Err(EvalError::new(
+                            "TypeError",
+                            "Hash.merge expects another Hash",
                         ))
                     }
                     "dig" => {
@@ -1194,8 +1283,9 @@ impl Engine {
                             let key = match arg {
                                 Value::String(s) | Value::Symbol(s) => s.clone(),
                                 _ => {
-                                    return Err(EvalError::Message(
-                                        "dig keys must be symbols or strings".to_string(),
+                                    return Err(EvalError::new(
+                                        "TypeError",
+                                        "dig keys must be symbols or strings",
                                     ));
                                 }
                             };
@@ -1260,7 +1350,7 @@ impl Engine {
                             }
                             Ok(Value::new_hash(new_map))
                         } else {
-                            Err(EvalError::Message("select requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "select requires a block"))
                         }
                     }
                     "reject" => {
@@ -1286,7 +1376,7 @@ impl Engine {
                             }
                             Ok(Value::new_hash(new_map))
                         } else {
-                            Err(EvalError::Message("reject requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "reject requires a block"))
                         }
                     }
                     "transform_keys" => {
@@ -1311,8 +1401,9 @@ impl Engine {
                             }
                             Ok(Value::new_hash(new_map))
                         } else {
-                            Err(EvalError::Message(
-                                "transform_keys requires a block".to_string(),
+                            Err(EvalError::new(
+                                "ArgumentError",
+                                "transform_keys requires a block",
                             ))
                         }
                     }
@@ -1334,28 +1425,33 @@ impl Engine {
                             }
                             Ok(Value::new_hash(new_map))
                         } else {
-                            Err(EvalError::Message(
-                                "transform_values requires a block".to_string(),
+                            Err(EvalError::new(
+                                "ArgumentError",
+                                "transform_values requires a block",
                             ))
                         }
                     }
                     "[]=" => {
                         if args.len() < 2 {
-                            return Err(EvalError::Message(
-                                "[]= expects key and value".to_string(),
+                            return Err(EvalError::new(
+                                "ArgumentError",
+                                "[]= expects key and value",
                             ));
                         }
                         if let Value::String(s) = &args[0] {
                             h.write().unwrap().insert(s.clone(), args[1].clone());
                             Ok(args[1].clone())
                         } else {
-                            Err(EvalError::Message("Hash key must be string".to_string()))
+                            Err(EvalError::new("TypeError", "Hash key must be string"))
                         }
                     }
-                    _ => Err(EvalError::Message(format!(
-                        "Method '{}' not supported for Hash and key not found",
-                        method
-                    ))),
+                    _ => Err(EvalError::new(
+                        "RuntimeError",
+                        &format!(
+                            "Method '{}' not supported for Hash and key not found",
+                            method
+                        ),
+                    )),
                 }
             }
             (Value::Array(a), method, block) => {
@@ -1381,8 +1477,9 @@ impl Engine {
                             }
                             Ok(Value::Nil)
                         } else {
-                            Err(EvalError::Message(
-                                "Array.fetch expects an integer index".to_string(),
+                            Err(EvalError::new(
+                                "ArgumentError",
+                                "Array.fetch expects an integer index",
                             ))
                         }
                     }
@@ -1435,7 +1532,7 @@ impl Engine {
                             }
                             Ok(Value::Nil)
                         } else {
-                            Err(EvalError::Message("find requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "find requires a block"))
                         }
                     }
                     "find_index" => {
@@ -1454,8 +1551,9 @@ impl Engine {
                             }
                             Ok(Value::Nil)
                         } else {
-                            Err(EvalError::Message(
-                                "find_index requires a block".to_string(),
+                            Err(EvalError::new(
+                                "ArgumentError",
+                                "find_index requires a block",
                             ))
                         }
                     }
@@ -1595,8 +1693,9 @@ impl Engine {
                     "chunk" => {
                         let size = args.first().and_then(|v| v.as_int()).unwrap_or(0);
                         if size <= 0 {
-                            return Err(EvalError::Message(
-                                "chunk size must be positive".to_string(),
+                            return Err(EvalError::new(
+                                "RuntimeError",
+                                "chunk size must be positive",
                             ));
                         }
                         let chunks: Vec<Value> = arr_snapshot
@@ -1608,8 +1707,9 @@ impl Engine {
                     "window" => {
                         let size = args.first().and_then(|v| v.as_int()).unwrap_or(0);
                         if size <= 0 {
-                            return Err(EvalError::Message(
-                                "window size must be positive".to_string(),
+                            return Err(EvalError::new(
+                                "RuntimeError",
+                                "window size must be positive",
                             ));
                         }
                         if size as usize > arr_snapshot.len() {
@@ -1665,7 +1765,7 @@ impl Engine {
                             }
                             Ok(Value::Array(a.clone()))
                         } else {
-                            Err(EvalError::Message("each requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "each requires a block"))
                         }
                     }
                     "map" => {
@@ -1683,7 +1783,7 @@ impl Engine {
                             }
                             Ok(Value::new_array(results))
                         } else {
-                            Err(EvalError::Message("map requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "map requires a block"))
                         }
                     }
                     "select" => {
@@ -1703,7 +1803,7 @@ impl Engine {
                             }
                             Ok(Value::new_array(results))
                         } else {
-                            Err(EvalError::Message("select requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "select requires a block"))
                         }
                     }
                     "reduce" => {
@@ -1724,7 +1824,7 @@ impl Engine {
                             }
                             Ok(acc)
                         } else {
-                            Err(EvalError::Message("reduce requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "reduce requires a block"))
                         }
                     }
                     "sort" => {
@@ -1795,7 +1895,7 @@ impl Engine {
                                 paired.into_iter().map(|(v, _)| v).collect(),
                             ))
                         } else {
-                            Err(EvalError::Message("sort_by requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "sort_by requires a block"))
                         }
                     }
                     "partition" => {
@@ -1821,7 +1921,10 @@ impl Engine {
                                 Value::new_array(right),
                             ]))
                         } else {
-                            Err(EvalError::Message("partition requires a block".to_string()))
+                            Err(EvalError::new(
+                                "ArgumentError",
+                                "partition requires a block",
+                            ))
                         }
                     }
                     "group_by" | "group_by_stable" => {
@@ -1855,7 +1958,7 @@ impl Engine {
                             }
                             Ok(Value::new_hash(res_map))
                         } else {
-                            Err(EvalError::Message("group_by requires a block".to_string()))
+                            Err(EvalError::new("ArgumentError", "group_by requires a block"))
                         }
                     }
                     "tally" => {
@@ -1889,8 +1992,9 @@ impl Engine {
                     }
                     "[]=" => {
                         if args.len() < 2 {
-                            return Err(EvalError::Message(
-                                "[]= expects index and value".to_string(),
+                            return Err(EvalError::new(
+                                "ArgumentError",
+                                "[]= expects index and value",
                             ));
                         }
                         if let Some(i) = args[0].as_int() {
@@ -1900,19 +2004,19 @@ impl Engine {
                                 mut_arr[idx] = args[1].clone();
                                 Ok(args[1].clone())
                             } else {
-                                return Err(EvalError::Message(format!(
-                                    "index {} out of bounds",
-                                    idx
-                                )));
+                                return Err(EvalError::new(
+                                    "RuntimeError",
+                                    &format!("index {} out of bounds", idx),
+                                ));
                             }
                         } else {
-                            return Err(EvalError::Message("Array index must be int".to_string()));
+                            return Err(EvalError::new("TypeError", "Array index must be int"));
                         }
                     }
-                    _ => Err(EvalError::Message(format!(
-                        "Method '{}' not supported for Array",
-                        method
-                    ))),
+                    _ => Err(EvalError::new(
+                        "RuntimeError",
+                        &format!("Method '{}' not supported for Array", method),
+                    )),
                 }
             }
 
@@ -1924,9 +2028,7 @@ impl Engine {
                     if let Some(c) = s.chars().next() {
                         Ok(Value::Int(c as i64))
                     } else {
-                        Err(EvalError::Message(
-                            "ord requires non-empty string".to_string(),
-                        ))
+                        Err(EvalError::new("TypeError", "ord requires non-empty string"))
                     }
                 }
                 "chomp" => {
@@ -1996,7 +2098,7 @@ impl Engine {
                 }
                 "strip!" => {
                     if let Value::Symbol(_) = receiver {
-                        return Err(EvalError::Message("Cannot mutate symbol".to_string()));
+                        return Err(EvalError::new("TypeError", "Cannot mutate symbol"));
                     }
                     let res = s.trim();
                     if res == s {
@@ -2062,8 +2164,9 @@ impl Engine {
                 }
                 "match" => {
                     if let Some(Value::String(pattern)) = args.first() {
-                        let re = Regex::new(pattern)
-                            .map_err(|e| EvalError::Message(format!("invalid regex: {}", e)))?;
+                        let re = Regex::new(pattern).map_err(|e| {
+                            EvalError::new("RuntimeError", &format!("invalid regex: {}", e))
+                        })?;
                         if let Some(caps) = re.captures(&s) {
                             let groups: Vec<Value> = caps
                                 .iter()
@@ -2078,23 +2181,26 @@ impl Engine {
                             Ok(Value::Nil)
                         }
                     } else {
-                        Err(EvalError::Message(
-                            "match expects a regex pattern".to_string(),
+                        Err(EvalError::new(
+                            "ArgumentError",
+                            "match expects a regex pattern",
                         ))
                     }
                 }
                 "scan" => {
                     if let Some(Value::String(pattern)) = args.first() {
-                        let re = Regex::new(pattern)
-                            .map_err(|e| EvalError::Message(format!("invalid regex: {}", e)))?;
+                        let re = Regex::new(pattern).map_err(|e| {
+                            EvalError::new("RuntimeError", &format!("invalid regex: {}", e))
+                        })?;
                         let matches: Vec<Value> = re
                             .find_iter(&s)
                             .map(|m| Value::String(m.as_str().to_string()))
                             .collect();
                         Ok(Value::new_array(matches))
                     } else {
-                        Err(EvalError::Message(
-                            "scan expects a regex pattern".to_string(),
+                        Err(EvalError::new(
+                            "ArgumentError",
+                            "scan expects a regex pattern",
                         ))
                     }
                 }
@@ -2221,8 +2327,8 @@ impl Engine {
                         .unwrap_or(false);
                     let all = method.contains("gsub");
                     let result = if is_regex {
-                        let re =
-                            Regex::new(pattern).map_err(|e| EvalError::Message(e.to_string()))?;
+                        let re = Regex::new(pattern)
+                            .map_err(|e| EvalError::new("RuntimeError", &e.to_string()))?;
                         if all {
                             re.replace_all(&s, replacement).to_string()
                         } else {
@@ -2331,10 +2437,10 @@ impl Engine {
                     }
                     Ok(Value::String(result))
                 }
-                _ => Err(EvalError::Message(format!(
-                    "Method '{}' not supported for String",
-                    method
-                ))),
+                _ => Err(EvalError::new(
+                    "RuntimeError",
+                    &format!("Method '{}' not supported for String", method),
+                )),
             },
 
             (Value::Int(i), method, block) => match method {
@@ -2348,14 +2454,14 @@ impl Engine {
                 "odd?" => Ok(Value::Bool(i % 2 != 0)),
                 "clamp" => {
                     if args.len() != 2 {
-                        return Err(EvalError::Message("clamp expects min and max".to_string()));
+                        return Err(EvalError::new("ArgumentError", "clamp expects min and max"));
                     }
                     let min = args[0]
                         .as_int()
-                        .ok_or_else(|| EvalError::Message("min must be int".to_string()))?;
+                        .ok_or_else(|| EvalError::new("TypeError", "min must be int"))?;
                     let max = args[1]
                         .as_int()
-                        .ok_or_else(|| EvalError::Message("max must be int".to_string()))?;
+                        .ok_or_else(|| EvalError::new("TypeError", "max must be int"))?;
                     Ok(Value::Int(i.clamp(min, max)))
                 }
                 "times" => {
@@ -2377,10 +2483,13 @@ impl Engine {
                         }
                         Ok(Value::Int(i))
                     } else {
-                        Err(EvalError::Message("times requires a block".to_string()))
+                        Err(EvalError::new("ArgumentError", "times requires a block"))
                     }
                 }
-                _ => Err(EvalError::Message(format!("unknown int member {}", method))),
+                _ => Err(EvalError::new(
+                    "RuntimeError",
+                    &format!("unknown int member {}", method),
+                )),
             },
 
             (Value::Float(f), method, _) => match method {
@@ -2390,22 +2499,22 @@ impl Engine {
                 "ceil" => Ok(Value::Int(f.ceil() as i64)),
                 "clamp" => {
                     if args.len() != 2 {
-                        return Err(EvalError::Message("clamp expects min and max".to_string()));
+                        return Err(EvalError::new("ArgumentError", "clamp expects min and max"));
                     }
                     let min = args[0]
                         .as_float()
                         .or_else(|| args[0].as_int().map(|i| i as f64))
-                        .ok_or_else(|| EvalError::Message("min must be numeric".to_string()))?;
+                        .ok_or_else(|| EvalError::new("TypeError", "min must be numeric"))?;
                     let max = args[1]
                         .as_float()
                         .or_else(|| args[1].as_int().map(|i| i as f64))
-                        .ok_or_else(|| EvalError::Message("max must be numeric".to_string()))?;
+                        .ok_or_else(|| EvalError::new("TypeError", "max must be numeric"))?;
                     Ok(Value::Float(f.clamp(min, max)))
                 }
-                _ => Err(EvalError::Message(format!(
-                    "unknown float member {}",
-                    method
-                ))),
+                _ => Err(EvalError::new(
+                    "RuntimeError",
+                    &format!("unknown float member {}", method),
+                )),
             },
 
             (Value::Money { cents, currency }, method, _) => match method {
@@ -2416,10 +2525,10 @@ impl Engine {
                     cents as f64 / 100.0,
                     currency
                 ))),
-                _ => Err(EvalError::Message(format!(
-                    "unknown money member {}",
-                    method
-                ))),
+                _ => Err(EvalError::new(
+                    "RuntimeError",
+                    &format!("unknown money member {}", method),
+                )),
             },
 
             (Value::Duration(s), method, _) => match method {
@@ -2470,10 +2579,10 @@ impl Engine {
                     let d = chrono::Duration::seconds(s);
                     Ok(Value::Time(anchor + d))
                 }
-                _ => Err(EvalError::Message(format!(
-                    "unknown duration member {}",
-                    method
-                ))),
+                _ => Err(EvalError::new(
+                    "RuntimeError",
+                    &format!("unknown duration member {}", method),
+                )),
             },
 
             (Value::Time(t), method, _) => match method {
@@ -2500,10 +2609,10 @@ impl Engine {
                 "hour" => Ok(Value::Int(t.hour() as i64)),
                 "minute" => Ok(Value::Int(t.minute() as i64)),
                 "second" => Ok(Value::Int(t.second() as i64)),
-                _ => Err(EvalError::Message(format!(
-                    "unknown time member {}",
-                    method
-                ))),
+                _ => Err(EvalError::new(
+                    "RuntimeError",
+                    &format!("unknown time member {}", method),
+                )),
             },
 
             (Value::Instance(inst), method, _) => {
@@ -2512,16 +2621,16 @@ impl Engine {
                     if f.is_private {
                         if let Some(Value::Instance(curr_self)) = self.get_var("self") {
                             if !Arc::ptr_eq(&curr_self, &inst) {
-                                return Err(EvalError::Message(format!(
-                                    "Method '{}' is private",
-                                    method
-                                )));
+                                return Err(EvalError::new(
+                                    "RuntimeError",
+                                    &format!("Method '{}' is private", method),
+                                ));
                             }
                         } else {
-                            return Err(EvalError::Message(format!(
-                                "Method '{}' is private",
-                                method
-                            )));
+                            return Err(EvalError::new(
+                                "RuntimeError",
+                                &format!("Method '{}' is private", method),
+                            ));
                         }
                     }
                     self.stack.push(HashMap::new());
@@ -2530,10 +2639,10 @@ impl Engine {
                     self.stack.pop();
                     cf.map(|c| c.value())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Method '{}' not found for class '{}'",
-                        method, class.name
-                    )))
+                    Err(EvalError::new(
+                        "RuntimeError",
+                        &format!("Method '{}' not found for class '{}'", method, class.name),
+                    ))
                 }
             }
 
@@ -2562,10 +2671,10 @@ impl Engine {
 
             (_, "to_string", _) => Ok(Value::String(receiver.to_string())),
 
-            _ => Err(EvalError::Message(format!(
-                "Method '{}' not supported for this type",
-                method
-            ))),
+            _ => Err(EvalError::new(
+                "RuntimeError",
+                &format!("Method '{}' not supported for this type", method),
+            )),
         }
     }
 
@@ -2577,9 +2686,7 @@ impl Engine {
             .ok_or_else(|| format!("Function '{}' not found", name))?;
 
         self.call_function_def(&fn_def, args, None)
-            .map_err(|e| match e {
-                EvalError::Message(m) => m,
-            })
+            .map_err(|e| e.message)
     }
 
     fn call_function_def(
@@ -2596,32 +2703,41 @@ impl Engine {
         &mut self,
         func: &FunctionDef,
         args: Vec<Value>,
-        _block: Option<&Expr>,
+        block: Option<&Expr>,
     ) -> Result<ControlFlow, EvalError> {
         self.recursion_depth += 1;
         if self.recursion_depth > MAX_RECURSION_DEPTH {
             self.recursion_depth -= 1;
-            return Err(EvalError::Message(
-                "Stack overflow: maximum recursion depth exceeded".to_string(),
+            return Err(EvalError::new(
+                "RuntimeError",
+                "Stack overflow: maximum recursion depth exceeded",
             ));
         }
 
-        let result = self.do_call_function_def(func, args, _block)?;
+        let old_block = self.current_block.take();
+        if let Some(b) = block {
+            self.current_block = Some(self.eval_expr(b)?);
+        }
+
+        let result = self.do_call_function_def(func, args, block)?;
 
         if let Some(expected_ret_ty) = &func.return_type {
             if let Err(e) = self.validate_value_type(&result.value(), expected_ret_ty) {
+                self.current_block = old_block;
                 self.recursion_depth -= 1;
-                return Err(EvalError::Message(format!(
-                    "return value expected {}, got {}: {}",
-                    expected_ret_ty.name,
-                    result.value().kind_name(),
-                    match e {
-                        EvalError::Message(m) => m,
-                    }
-                )));
+                return Err(EvalError::new(
+                    "TypeError",
+                    &format!(
+                        "return value expected {}, got {}: {}",
+                        expected_ret_ty.name,
+                        result.value().kind_name(),
+                        e.message
+                    ),
+                ));
             }
         }
 
+        self.current_block = old_block;
         self.recursion_depth -= 1;
         Ok(result)
     }
@@ -2633,26 +2749,30 @@ impl Engine {
         _block: Option<&Expr>,
     ) -> Result<ControlFlow, EvalError> {
         if func.params.len() != args.len() {
-            return Err(EvalError::Message(format!(
-                "Expected {} arguments, but got {}",
-                func.params.len(),
-                args.len()
-            )));
+            return Err(EvalError::new(
+                "ArgumentError",
+                &format!(
+                    "Expected {} arguments, but got {}",
+                    func.params.len(),
+                    args.len()
+                ),
+            ));
         }
 
         let mut new_scope = HashMap::new();
         for (param, val) in func.params.iter().zip(args) {
             if let Some(expected_ty) = &param.param_type {
                 if let Err(e) = self.validate_value_type(&val, expected_ty) {
-                    return Err(EvalError::Message(format!(
-                        "argument {} expected {}, got {}: {}",
-                        param.name,
-                        expected_ty.name,
-                        val.kind_name(),
-                        match e {
-                            EvalError::Message(m) => m,
-                        }
-                    )));
+                    return Err(EvalError::new(
+                        "TypeError",
+                        &format!(
+                            "argument {} expected {}, got {}: {}",
+                            param.name,
+                            expected_ty.name,
+                            val.kind_name(),
+                            e.message
+                        ),
+                    ));
                 }
             }
 
@@ -2960,90 +3080,90 @@ impl Engine {
                 if matches!(val, Value::Int(_)) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Int, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Int, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Float => {
                 if matches!(val, Value::Float(_)) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Float, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Float, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Number => {
                 if matches!(val, Value::Int(_) | Value::Float(_)) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Number, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Number, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::String => {
                 if matches!(val, Value::String(_)) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected String, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected String, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Bool => {
                 if matches!(val, Value::Bool(_)) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Bool, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Bool, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Nil => {
                 if matches!(val, Value::Nil) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Nil, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Nil, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Duration => {
                 if matches!(val, Value::Duration(_)) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Duration, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Duration, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Time => {
                 if matches!(val, Value::Time(_)) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Time, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Time, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Money => {
                 if matches!(val, Value::Money { .. }) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Money, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Money, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Array => {
@@ -3051,8 +3171,9 @@ impl Engine {
                     if expected.type_args.is_empty() {
                         Ok(())
                     } else if expected.type_args.len() != 1 {
-                        Err(EvalError::Message(
-                            "Array type expects exactly 1 type argument".to_string(),
+                        Err(EvalError::new(
+                            "TypeError",
+                            "Array type expects exactly 1 type argument",
                         ))
                     } else {
                         let elem_type = &expected.type_args[0];
@@ -3063,10 +3184,10 @@ impl Engine {
                         Ok(())
                     }
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Array, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Array, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Hash => {
@@ -3074,8 +3195,9 @@ impl Engine {
                     if expected.type_args.is_empty() {
                         Ok(())
                     } else if expected.type_args.len() != 2 {
-                        Err(EvalError::Message(
-                            "Hash type expects exactly 2 type arguments".to_string(),
+                        Err(EvalError::new(
+                            "TypeError",
+                            "Hash type expects exactly 2 type arguments",
                         ))
                     } else {
                         let key_type = &expected.type_args[0];
@@ -3092,35 +3214,41 @@ impl Engine {
                         Ok(())
                     }
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Hash, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Hash, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Shape => {
                 if let Value::Hash(h) | Value::Object(h) = val {
                     let hash = h.read().unwrap();
                     if hash.len() != expected.shape.len() {
-                        return Err(EvalError::Message(format!(
-                            "Shape mismatch: expected {} fields, got {}",
-                            expected.shape.len(),
-                            hash.len()
-                        )));
+                        return Err(EvalError::new(
+                            "TypeError",
+                            &format!(
+                                "Shape mismatch: expected {} fields, got {}",
+                                expected.shape.len(),
+                                hash.len()
+                            ),
+                        ));
                     }
                     for (field, field_type) in &expected.shape {
                         if let Some(field_val) = hash.get(field) {
                             self.do_validate_value_type(field_val, field_type, state)?;
                         } else {
-                            return Err(EvalError::Message(format!("Missing field: {}", field)));
+                            return Err(EvalError::new(
+                                "TypeError",
+                                &format!("Missing field: {}", field),
+                            ));
                         }
                     }
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Hash for Shape, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Hash for Shape, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Union => {
@@ -3129,52 +3257,52 @@ impl Engine {
                         return Ok(());
                     }
                 }
-                Err(EvalError::Message(format!(
-                    "Value {} does not match any union type",
-                    val.to_string()
-                )))
+                Err(EvalError::new(
+                    "TypeError",
+                    &format!("Value {} does not match any union type", val.to_string()),
+                ))
             }
             TypeKind::Enum => {
                 if let Value::EnumVariant { enum_name, .. } = val {
                     if enum_name.to_lowercase() == expected.name.to_lowercase() {
                         Ok(())
                     } else {
-                        Err(EvalError::Message(format!(
-                            "Expected enum {}, got {}",
-                            expected.name, enum_name
-                        )))
+                        Err(EvalError::new(
+                            "TypeError",
+                            &format!("Expected enum {}, got {}", expected.name, enum_name),
+                        ))
                     }
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected EnumVariant, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected EnumVariant, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Function => {
                 if matches!(val, Value::Function(_) | Value::Builtin(_)) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Function, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Function, got {}", val.kind_name()),
+                    ))
                 }
             }
             TypeKind::Object => {
                 if matches!(val, Value::Object(_)) {
                     Ok(())
                 } else {
-                    Err(EvalError::Message(format!(
-                        "Expected Object, got {}",
-                        val.kind_name()
-                    )))
+                    Err(EvalError::new(
+                        "TypeError",
+                        &format!("Expected Object, got {}", val.kind_name()),
+                    ))
                 }
             }
-            _ => Err(EvalError::Message(format!(
-                "Unsupported or unknown type {}",
-                expected.name
-            ))),
+            _ => Err(EvalError::new(
+                "TypeError",
+                &format!("Unsupported or unknown type {}", expected.name),
+            )),
         };
 
         if let Some(v) = visit {
